@@ -1,4 +1,0 @@
-(call
-   (strcpy $arg1 $arg2 (unsafe_call "strcpy" $arg1 $arg2))
-   (strcat $arg1 $arg2 (unsafe_call "strcat" $arg1 $arg2))
-   (strcmp $arg1 $arg2 (unsage_call "strcmp" $arg1 $arg2)))
