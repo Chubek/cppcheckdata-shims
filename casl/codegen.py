@@ -1,958 +1,815 @@
-# casl/codegen.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-CASL Code Generator — AST → Python addon source code
+casl/codegen.py
+===============
 
-The generated addon follows the cppcheck addon protocol:
-  - Reads a .dump file path from sys.argv
-  - Parses it with cppcheckdata.parsedump()
-  - Runs checkers using cppcheckdata_shims
-  - Outputs JSON diagnostics to stdout (--cli mode) or stderr
+Code generator for CASL specifications.
+
+This module transforms validated CASL ASTs into executable Python code
+that implements Cppcheck addons. The generated code:
+
+1. Imports necessary runtime support from `casl.runtime`
+2. Defines pattern matchers as Python functions
+3. Compiles constraints to Python predicates
+4. Generates dataflow analysis configurations
+5. Produces the `check(data)` entry point expected by Cppcheck
+
+Architecture
+------------
+The code generator uses a multi-pass approach:
+
+1. **Prologue generation** — imports, constants, domain setup
+2. **Domain compilation** — abstract domain definitions
+3. **Pattern compilation** — pattern matching functions
+4. **Dataflow compilation** — transfer functions, analysis setup
+5. **Query compilation** — constraint checking, action execution
+6. **Checker compilation** — main checker orchestration
+7. **Epilogue generation** — check() entry point, CLI support
+
+Design Principles
+-----------------
+- **Readability**: Generated code is formatted and commented
+- **Debuggability**: Line mappings back to CASL source
+- **Efficiency**: Avoid unnecessary allocations in hot paths
+- **Correctness**: Preserve CASL semantics exactly
+
+References
+----------
+- PQL code generation strategy
+- Møller & Schwartzbach interprocedural analysis
+- Cppcheck addon API conventions
 """
 
 from __future__ import annotations
 
+import hashlib
+import keyword
+import re
 import textwrap
-from typing import Optional
-
-from casl.ast_nodes import (
-    Program, AddonDecl, ImportStmt, CheckerDecl, FnDecl, ConstDecl,
-    TypeAliasDecl, PatternDecl, QueryDecl, OnBlock, SuppressDecl,
-    LetStmt, AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt,
-    EmitStmt, BreakStmt, ContinueStmt, ExprStmt,
-    Identifier, IntLiteral, FloatLiteral, StringLiteral, BoolLiteral,
-    NullLiteral, ListLiteral, MapLiteral, SetLiteral,
-    UnaryExpr, BinaryExpr, TernaryExpr, CallExpr, IndexExpr,
-    MemberExpr, MethodCallExpr, LambdaExpr, MatchExpr, MatchArm,
-    TokenPattern, ScopePattern, CallPattern, AssignPattern,
-    DerefPattern, BinopPattern, WildcardPattern,
-    PatternClauseMatch, PatternClauseWhere, PatternClauseEnsures,
-    OnEvent, Severity, Confidence, AssignOp, UnaryOp, BinOp,
-    Param, TypeName, TypeGeneric,
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum, auto
+from io import StringIO
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
 )
 
+from casl import ast as A
+from casl.visitor import ASTVisitor, DepthFirstVisitor
+from casl.semantic import SemanticContext, Symbol, SymbolKind
+from casl.errors import CodeGenError, SourceLocation
 
-class CodeGenError(Exception):
-    """Error during code generation."""
-    pass
-
-
-class _Emitter:
-    """Builds Python source incrementally with indentation tracking."""
-
-    def __init__(self):
-        self._lines: list[str] = []
-        self._indent: int = 0
-
-    def line(self, code: str = ""):
-        if code:
-            self._lines.append("    " * self._indent + code)
-        else:
-            self._lines.append("")
-
-    def indent(self):
-        self._indent += 1
-
-    def dedent(self):
-        self._indent = max(0, self._indent - 1)
-
-    def blank(self):
-        self._lines.append("")
-
-    def comment(self, text: str):
-        for ln in text.split("\n"):
-            self.line(f"# {ln}")
-
-    def docstring(self, text: str):
-        self.line(f'"""{text}"""')
-
-    def result(self) -> str:
-        return "\n".join(self._lines) + "\n"
+__all__ = [
+    "generate",
+    "CodeGenerator",
+    "CodeEmitter",
+    "GeneratedAddon",
+]
 
 
-def _py_op(op: BinOp) -> str:
-    """Map CASL binary operator to Python."""
-    mapping = {
-        BinOp.OR: "or", BinOp.AND: "and",
-        BinOp.BIT_OR: "|", BinOp.BIT_XOR: "^", BinOp.BIT_AND: "&",
-        BinOp.EQ: "==", BinOp.NE: "!=",
-        BinOp.LT: "<", BinOp.GT: ">", BinOp.LE: "<=", BinOp.GE: ">=",
-        BinOp.ADD: "+", BinOp.SUB: "-",
-        BinOp.MUL: "*", BinOp.DIV: "/", BinOp.MOD: "%",
-    }
-    return mapping[op]
+# ═══════════════════════════════════════════════════════════════════════════
+# CODE EMITTER
+# ═══════════════════════════════════════════════════════════════════════════
 
-
-def _py_unary(op: UnaryOp) -> str:
-    mapping = {UnaryOp.NOT: "not ", UnaryOp.NEG: "-", UnaryOp.BITNOT: "~"}
-    return mapping[op]
-
-
-def _py_assign_op(op: AssignOp) -> str:
-    return op.value
-
-
-def _severity_str(sev: Optional[Severity]) -> str:
-    if sev is None:
-        return "'warning'"
-    return repr(sev.value)
-
-
-def _confidence_str(conf: Optional[Confidence]) -> str:
-    if conf is None:
-        return "'probable'"
-    return repr(conf.value)
-
-
-class CodeGenerator:
+class CodeEmitter:
+    """Low-level code emission with indentation management.
+    
+    Provides a structured way to emit Python code with:
+    - Automatic indentation tracking
+    - Block context managers
+    - Line and source mapping
+    - String literal escaping
     """
-    Generates a complete Python cppcheck addon from a CASL AST.
-
-    The generated code:
-    1. Imports cppcheckdata and cppcheckdata_shims
-    2. Defines helper functions for pattern matching
-    3. Defines each checker as a class inheriting from a base
-    4. Has a main() that parses the dump and runs all checkers
-    """
-
-    def __init__(self, program: Program, source_filename: str = "<casl>"):
-        self.program = program
-        self.source_filename = source_filename
-        self.e = _Emitter()
-        self._checker_names: list[str] = []
-        self._fn_names: list[str] = []
-
-    def generate(self) -> str:
-        """Generate and return complete Python source."""
-        self._emit_header()
-        self._emit_imports()
-        self._emit_runtime_helpers()
-        self._emit_constants()
-        self._emit_functions()
-        self._emit_checkers()
-        self._emit_main()
-        return self.e.result()
-
-    # ── Header ───────────────────────────────────────────────────
-
-    def _emit_header(self):
-        e = self.e
-        e.comment("=" * 70)
-        e.comment(f"Auto-generated cppcheck addon from CASL source")
-        if self.program.addon:
-            e.comment(f"Addon: {self.program.addon.name}")
-            if self.program.addon.description:
-                e.comment(f"Description: {self.program.addon.description}")
-        e.comment(f"Source: {self.source_filename}")
-        e.comment("DO NOT EDIT — regenerate from the .casl source file")
-        e.comment("=" * 70)
-        e.blank()
-
-    # ── Imports ──────────────────────────────────────────────────
-
-    def _emit_imports(self):
-        e = self.e
-        e.line("from __future__ import annotations")
-        e.blank()
-        e.line("import sys")
-        e.line("import os")
-        e.line("import json")
-        e.line("import argparse")
-        e.line("from typing import Any, Optional")
-        e.blank()
-        e.comment("cppcheck data access")
-        e.line("try:")
-        e.indent()
-        e.line("import cppcheckdata")
-        e.line("from cppcheckdata import parsedump, CppcheckData")
-        e.dedent()
-        e.line("except ImportError:")
-        e.indent()
-        e.line("# Allow the module to be found via deps/ in typical addon layout")
-        e.line("sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'deps'))")
-        e.line("import cppcheckdata")
-        e.line("from cppcheckdata import parsedump, CppcheckData")
-        e.dedent()
-        e.blank()
-        e.comment("cppcheckdata-shims analyses")
-        e.line("try:")
-        e.indent()
-        e.line("from cppcheckdata_shims.dataflow_analyses import (")
-        e.line("    ReachingDefinitions, LiveVariables, IntervalAnalysis,")
-        e.line("    NullPointerAnalysis, TaintAnalysis, SignAnalysis,")
-        e.line("    ConstantPropagation, PointerAnalysis, run_all_analyses,")
-        e.line(")")
-        e.line("from cppcheckdata_shims.ctrlflow_graph import build_cfg")
-        e.line("from cppcheckdata_shims.callgraph import build_callgraph")
-        e.line("from cppcheckdata_shims.checkers import (")
-        e.line("    Checker, CheckerContext, CheckerRunner, CheckerRunResults,")
-        e.line("    DiagnosticSeverity, Confidence as ShimConfidence,")
-        e.line(")")
-        e.dedent()
-        e.line("except ImportError:")
-        e.indent()
-        e.line("sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))")
-        e.line("from cppcheckdata_shims.dataflow_analyses import (")
-        e.line("    ReachingDefinitions, LiveVariables, IntervalAnalysis,")
-        e.line("    NullPointerAnalysis, TaintAnalysis, SignAnalysis,")
-        e.line("    ConstantPropagation, PointerAnalysis, run_all_analyses,")
-        e.line(")")
-        e.line("from cppcheckdata_shims.ctrlflow_graph import build_cfg")
-        e.line("from cppcheckdata_shims.callgraph import build_callgraph")
-        e.line("from cppcheckdata_shims.checkers import (")
-        e.line("    Checker, CheckerContext, CheckerRunner, CheckerRunResults,")
-        e.line("    DiagnosticSeverity, Confidence as ShimConfidence,")
-        e.line(")")
-        e.dedent()
-        e.blank()
-
-        # Emit CASL imports (other CASL modules)
-        for item in self.program.items:
-            if isinstance(item, ImportStmt):
-                mod_path = ".".join(item.path)
-                e.line(f"import {mod_path}")
-        e.blank()
-
-    # ── Runtime Helpers ──────────────────────────────────────────
-
-    def _emit_runtime_helpers(self):
-        e = self.e
-        e.comment("─── CASL Runtime Helpers ─────────────────────────────")
-        e.blank()
-
-        # Diagnostic emitter
-        e.line("_CLI_MODE = '--cli' in sys.argv")
-        e.blank()
-        e.line("def _casl_emit(error_id: str, message: str, file: str,")
-        e.line("               linenr: int, column: int = 0,")
-        e.line("               severity: str = 'warning',")
-        e.line("               cwe: int = 0, addon: str = '',")
-        e.line("               confidence: str = 'probable'):")
-        e.indent()
-        e.line('"""Emit a diagnostic in cppcheck addon protocol."""')
-        e.line("if _CLI_MODE:")
-        e.indent()
-        e.line("msg = {")
-        e.indent()
-        e.line("'file': str(file or ''),")
-        e.line("'linenr': int(linenr or 0),")
-        e.line("'column': int(column or 0),")
-        e.line("'severity': severity,")
-        e.line("'message': message,")
-        e.line("'addon': addon,")
-        e.line("'errorId': error_id,")
-        e.line("'extra': '',")
-        e.dedent()
-        e.line("}")
-        e.line("if cwe:")
-        e.indent()
-        e.line("msg['cwe'] = cwe")
-        e.dedent()
-        e.line("sys.stdout.write(json.dumps(msg) + '\\n')")
-        e.dedent()
-        e.line("else:")
-        e.indent()
-        e.line("cwe_str = f' [CWE-{cwe}]' if cwe else ''")
-        e.line("sys.stderr.write(")
-        e.line("    f'{file}:{linenr}:{column}: {severity}: {message} "
-               "[{error_id}]{cwe_str}\\n'")
-        e.line(")")
-        e.dedent()
-        e.dedent()
-        e.blank()
-
-        # Token iteration helper
-        e.line("def _iter_tokens(cfg):")
-        e.indent()
-        e.line('"""Iterate all tokens in a configuration."""')
-        e.line("for tok in getattr(cfg, 'tokenlist', []):")
-        e.indent()
-        e.line("yield tok")
-        e.dedent()
-        e.dedent()
-        e.blank()
-
-        # Scope iteration helper
-        e.line("def _iter_scopes(cfg):")
-        e.indent()
-        e.line('"""Iterate all scopes in a configuration."""')
-        e.line("for scope in getattr(cfg, 'scopes', []):")
-        e.indent()
-        e.line("yield scope")
-        e.dedent()
-        e.dedent()
-        e.blank()
-
-        # Function iteration helper
-        e.line("def _iter_functions(cfg):")
-        e.indent()
-        e.line('"""Iterate all functions in a configuration."""')
-        e.line("for func in getattr(cfg, 'functions', []):")
-        e.indent()
-        e.line("yield func")
-        e.dedent()
-        e.dedent()
-        e.blank()
-
-        # Variable iteration helper
-        e.line("def _iter_variables(cfg):")
-        e.indent()
-        e.line('"""Iterate all variables in a configuration."""')
-        e.line("for var in getattr(cfg, 'variables', []):")
-        e.indent()
-        e.line("yield var")
-        e.dedent()
-        e.dedent()
-        e.blank()
-
-        # Token pattern matcher
-        e.line("def _match_token(tok, **constraints) -> bool:")
-        e.indent()
-        e.line('"""Check if a token matches all given constraints."""')
-        e.line("for key, val in constraints.items():")
-        e.indent()
-        e.line("actual = getattr(tok, key, None)")
-        e.line("if callable(val):")
-        e.indent()
-        e.line("if not val(actual):")
-        e.indent()
-        e.line("return False")
-        e.dedent()
-        e.dedent()
-        e.line("elif actual != val:")
-        e.indent()
-        e.line("return False")
-        e.dedent()
-        e.dedent()
-        e.line("return True")
-        e.dedent()
-        e.blank()
-
-        # Pattern matching: call site detector
-        e.line("def _is_call_to(tok, func_name: str) -> bool:")
-        e.indent()
-        e.line('"""Check if token is a call to the named function."""')
-        e.line("if getattr(tok, 'str', None) != '(':")
-        e.indent()
-        e.line("return False")
-        e.dedent()
-        e.line("prev = getattr(tok, 'previous', None)")
-        e.line("if prev and getattr(prev, 'str', None) == func_name:")
-        e.indent()
-        e.line("return True")
-        e.dedent()
-        e.line("# Also check astOperand1 for function pointer calls")
-        e.line("op1 = getattr(tok, 'astOperand1', None)")
-        e.line("if op1 and getattr(op1, 'str', None) == func_name:")
-        e.indent()
-        e.line("return True")
-        e.dedent()
-        e.line("return False")
-        e.dedent()
-        e.blank()
-
-        # Suppression check
-        e.line("_SUPPRESSIONS = set()")
-        e.line("_FILE_SUPPRESSIONS = {}")
-        e.blank()
-        e.line("def _is_suppressed(error_id: str, file: str = '') -> bool:")
-        e.indent()
-        e.line("if error_id in _SUPPRESSIONS:")
-        e.indent()
-        e.line("return True")
-        e.dedent()
-        e.line("from fnmatch import fnmatch")
-        e.line("for eid, pattern in _FILE_SUPPRESSIONS.items():")
-        e.indent()
-        e.line("if eid == error_id and fnmatch(file, pattern):")
-        e.indent()
-        e.line("return True")
-        e.dedent()
-        e.dedent()
-        e.line("return False")
-        e.dedent()
-        e.blank()
-
-    # ── Constants ────────────────────────────────────────────────
-
-    def _emit_constants(self):
-        e = self.e
-        for item in self.program.items:
-            if isinstance(item, ConstDecl):
-                val = self._expr(item.value)
-                e.line(f"{item.name} = {val}")
-        e.blank()
-
-    # ── Top-level Functions ──────────────────────────────────────
-
-    def _emit_functions(self):
-        for item in self.program.items:
-            if isinstance(item, FnDecl):
-                self._emit_fn(item, indent=0)
-                self._fn_names.append(item.name)
-
-    def _emit_fn(self, fn: FnDecl, indent: int = 0):
-        e = self.e
-        params_str = ", ".join(p.name for p in fn.params)
-        e.line(f"def {fn.name}({params_str}):")
-        e.indent()
-        if fn.docstring:
-            e.docstring(fn.docstring)
-        if not fn.body:
-            e.line("pass")
+    
+    def __init__(self, indent_str: str = "    ") -> None:
+        self._buffer = StringIO()
+        self._indent_str = indent_str
+        self._indent_level = 0
+        self._line_number = 1
+        self._source_map: Dict[int, SourceLocation] = {}
+        self._current_source: Optional[SourceLocation] = None
+    
+    def emit(self, code: str) -> None:
+        """Emit a line of code at the current indentation."""
+        if code.strip():  # Non-empty line
+            self._buffer.write(self._indent_str * self._indent_level)
+            self._buffer.write(code)
+            if self._current_source:
+                self._source_map[self._line_number] = self._current_source
+        self._buffer.write("\n")
+        self._line_number += 1
+    
+    def emit_raw(self, code: str) -> None:
+        """Emit code without indentation (for multi-line strings)."""
+        for line in code.split("\n"):
+            self._buffer.write(line)
+            self._buffer.write("\n")
+            self._line_number += 1
+    
+    def emit_blank(self, count: int = 1) -> None:
+        """Emit blank lines."""
+        for _ in range(count):
+            self._buffer.write("\n")
+            self._line_number += 1
+    
+    def emit_comment(self, text: str) -> None:
+        """Emit a comment."""
+        for line in text.split("\n"):
+            self.emit(f"# {line}")
+    
+    def emit_docstring(self, text: str) -> None:
+        """Emit a docstring."""
+        lines = text.strip().split("\n")
+        if len(lines) == 1:
+            self.emit(f'"""{lines[0]}"""')
         else:
-            for stmt in fn.body:
-                self._emit_stmt(stmt)
-        e.dedent()
-        e.blank()
+            self.emit('"""')
+            for line in lines:
+                self.emit(line)
+            self.emit('"""')
+    
+    def indent(self) -> None:
+        """Increase indentation level."""
+        self._indent_level += 1
+    
+    def dedent(self) -> None:
+        """Decrease indentation level."""
+        self._indent_level = max(0, self._indent_level - 1)
+    
+    def block(self, header: str) -> "CodeEmitter._BlockContext":
+        """Context manager for indented blocks."""
+        return self._BlockContext(self, header)
+    
+    class _BlockContext:
+        """Context manager for code blocks."""
+        
+        def __init__(self, emitter: "CodeEmitter", header: str) -> None:
+            self._emitter = emitter
+            self._header = header
+        
+        def __enter__(self) -> "CodeEmitter":
+            self._emitter.emit(self._header)
+            self._emitter.indent()
+            return self._emitter
+        
+        def __exit__(self, *args: Any) -> None:
+            self._emitter.dedent()
+    
+    def set_source(self, location: Optional[SourceLocation]) -> None:
+        """Set current source location for mapping."""
+        self._current_source = location
+    
+    def get_code(self) -> str:
+        """Get the generated code."""
+        return self._buffer.getvalue()
+    
+    def get_source_map(self) -> Dict[int, SourceLocation]:
+        """Get the source map (generated line -> CASL location)."""
+        return dict(self._source_map)
+    
+    @staticmethod
+    def escape_string(s: str) -> str:
+        """Escape a string for Python code."""
+        return repr(s)
+    
+    @staticmethod
+    def make_identifier(name: str) -> str:
+        """Convert a name to a valid Python identifier."""
+        # Replace hyphens with underscores
+        result = name.replace("-", "_")
+        # Remove invalid characters
+        result = re.sub(r"[^a-zA-Z0-9_]", "", result)
+        # Ensure doesn't start with digit
+        if result and result[0].isdigit():
+            result = "_" + result
+        # Handle Python keywords
+        if keyword.iskeyword(result):
+            result = result + "_"
+        return result or "_unnamed"
 
-    # ── Checkers ─────────────────────────────────────────────────
 
-    def _emit_checkers(self):
-        e = self.e
-        for item in self.program.items:
-            if isinstance(item, CheckerDecl):
-                self._emit_checker(item)
+# ═══════════════════════════════════════════════════════════════════════════
+# GENERATED ADDON CONTAINER
+# ═══════════════════════════════════════════════════════════════════════════
 
-    def _emit_checker(self, checker: CheckerDecl):
-        e = self.e
-        class_name = f"_CASLChecker_{checker.name}"
-        self._checker_names.append(class_name)
+@dataclass
+class GeneratedAddon:
+    """Container for generated addon code and metadata."""
+    
+    code: str
+    source_map: Dict[int, SourceLocation]
+    spec_name: str
+    spec_version: str
+    generation_time: str
+    checkers: List[str]
+    domains: List[str]
+    patterns: List[str]
+    
+    def write_to_file(self, path: str) -> None:
+        """Write the generated code to a file."""
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.code)
+    
+    def get_metadata_comment(self) -> str:
+        """Get a metadata comment for the generated file."""
+        return f"""\
+# Generated by CASL Code Generator
+# Specification: {self.spec_name} v{self.spec_version}
+# Generated: {self.generation_time}
+# Checkers: {', '.join(self.checkers)}
+# Domains: {', '.join(self.domains)}
+# Patterns: {', '.join(self.patterns)}
+"""
 
-        addon_name = ""
-        if self.program.addon:
-            addon_name = self.program.addon.name
 
-        e.line(f"class {class_name}:")
-        e.indent()
+# ═══════════════════════════════════════════════════════════════════════════
+# EXPRESSION COMPILER
+# ═══════════════════════════════════════════════════════════════════════════
 
-        if checker.docstring:
-            e.docstring(checker.docstring)
+class ExpressionCompiler(ASTVisitor):
+    """Compile CASL expressions to Python expressions."""
+    
+    def __init__(self, context: "CompilationContext") -> None:
+        self.ctx = context
+    
+    def compile(self, expr: A.Expr) -> str:
+        """Compile an expression to Python code."""
+        return self.visit(expr)
+    
+    def visit_integer_lit(self, node: A.IntegerLit) -> str:
+        return str(node.value)
+    
+    def visit_float_lit(self, node: A.FloatLit) -> str:
+        return repr(node.value)
+    
+    def visit_string_lit(self, node: A.StringLit) -> str:
+        return repr(node.value)
+    
+    def visit_bool_lit(self, node: A.BoolLit) -> str:
+        return "True" if node.value else "False"
+    
+    def visit_nil_lit(self, node: A.NilLit) -> str:
+        return "None"
+    
+    def visit_symbol_lit(self, node: A.SymbolLit) -> str:
+        # Symbols become Python strings with a prefix
+        return f"Symbol({repr(node.name)})"
+    
+    def visit_identifier(self, node: A.Identifier) -> str:
+        name = CodeEmitter.make_identifier(node.name)
+        # Check if it's a pattern variable
+        if name in self.ctx.pattern_variables:
+            return f"bindings[{repr(node.name)}]"
+        # Check if it's a local variable
+        if name in self.ctx.local_variables:
+            return name
+        # Check if it's a domain value
+        if node.name in self.ctx.domain_values:
+            domain, value = self.ctx.domain_values[node.name]
+            return f"{domain}.{value}"
+        # Default to identifier
+        return name
+    
+    def visit_list_expr(self, node: A.ListExpr) -> str:
+        elements = ", ".join(self.visit(e) for e in node.elements)
+        return f"[{elements}]"
+    
+    def visit_set_expr(self, node: A.SetExpr) -> str:
+        if not node.elements:
+            return "frozenset()"
+        elements = ", ".join(self.visit(e) for e in node.elements)
+        return f"frozenset({{{elements}}})"
+    
+    def visit_map_expr(self, node: A.MapExpr) -> str:
+        if not node.entries:
+            return "{}"
+        entries = ", ".join(
+            f"{self.visit(k)}: {self.visit(v)}"
+            for k, v in node.entries
+        )
+        return f"{{{entries}}}"
+    
+    def visit_tuple_expr(self, node: A.TupleExpr) -> str:
+        elements = ", ".join(self.visit(e) for e in node.elements)
+        if len(node.elements) == 1:
+            return f"({elements},)"
+        return f"({elements})"
+    
+    def visit_call_expr(self, node: A.CallExpr) -> str:
+        func = self.visit(node.function)
+        args = ", ".join(self.visit(a) for a in node.arguments)
+        
+        # Handle special built-in functions
+        if isinstance(node.function, A.Identifier):
+            fname = node.function.name
+            if fname == "join":
+                return f"_lattice_join({args})"
+            elif fname == "meet":
+                return f"_lattice_meet({args})"
+            elif fname == "widen":
+                return f"_lattice_widen({args})"
+            elif fname == "leq":
+                return f"_lattice_leq({args})"
+            elif fname == "lookup":
+                return f"_map_lookup({args})"
+            elif fname == "update":
+                return f"_map_update({args})"
+            elif fname == "union":
+                return f"_set_union({args})"
+            elif fname == "intersect":
+                return f"_set_intersect({args})"
+            elif fname == "member":
+                return f"_set_member({args})"
+            elif fname == "empty-set":
+                return "frozenset()"
+            elif fname == "empty-map":
+                return "{}"
+            elif fname == "singleton":
+                return f"frozenset({{{args}}})"
+        
+        return f"{func}({args})"
+    
+    def visit_field_access(self, node: A.FieldAccess) -> str:
+        obj = self.visit(node.object)
+        field = CodeEmitter.make_identifier(node.field)
+        return f"{obj}.{field}"
+    
+    def visit_index_access(self, node: A.IndexAccess) -> str:
+        obj = self.visit(node.object)
+        index = self.visit(node.index)
+        return f"{obj}[{index}]"
+    
+    def visit_unary_expr(self, node: A.UnaryExpr) -> str:
+        operand = self.visit(node.operand)
+        op_map = {
+            "not": "not ",
+            "-": "-",
+            "+": "+",
+            "~": "~",
+        }
+        op = op_map.get(node.operator, node.operator)
+        return f"({op}{operand})"
+    
+    def visit_binary_expr(self, node: A.BinaryExpr) -> str:
+        left = self.visit(node.left)
+        right = self.visit(node.right)
+        
+        op_map = {
+            "and": "and",
+            "or": "or",
+            "==": "==",
+            "!=": "!=",
+            "<": "<",
+            "<=": "<=",
+            ">": ">",
+            ">=": ">=",
+            "+": "+",
+            "-": "-",
+            "*": "*",
+            "/": "/",
+            "%": "%",
+            "in": "in",
+        }
+        op = op_map.get(node.operator, node.operator)
+        return f"({left} {op} {right})"
+    
+    def visit_cond_expr(self, node: A.CondExpr) -> str:
+        cond = self.visit(node.condition)
+        then = self.visit(node.then_expr)
+        else_ = self.visit(node.else_expr)
+        return f"({then} if {cond} else {else_})"
+    
+    def visit_let_expr(self, node: A.LetExpr) -> str:
+        # Let expressions become immediately-invoked lambdas
+        bindings = []
+        for name, value in node.bindings:
+            bindings.append(f"{CodeEmitter.make_identifier(name)}={self.visit(value)}")
+        body = self.visit(node.body)
+        params = ", ".join(CodeEmitter.make_identifier(n) for n, _ in node.bindings)
+        args = ", ".join(bindings)
+        return f"(lambda {params}: {body})({args})"
+    
+    def visit_lambda_expr(self, node: A.LambdaExpr) -> str:
+        params = ", ".join(CodeEmitter.make_identifier(p.name) for p in node.params)
+        body = self.visit(node.body)
+        return f"(lambda {params}: {body})"
+    
+    def generic_visit(self, node: A.ASTNode) -> str:
+        raise CodeGenError(
+            f"Cannot compile expression of type {type(node).__name__}",
+            getattr(node, "location", None),
+        )
 
-        # Metadata
-        e.line(f"name = {repr(checker.name)}")
-        e.line(f"error_id = {repr(checker.error_id or checker.name)}")
-        e.line(f"severity = {_severity_str(checker.severity)}")
-        e.line(f"cwe = {checker.cwe or 0}")
-        e.line(f"confidence = {_confidence_str(checker.confidence)}")
-        e.line(f"addon_name = {repr(addon_name)}")
-        e.blank()
 
-        # __init__
-        e.line("def __init__(self):")
-        e.indent()
-        e.line("self._diagnostics = []")
-        for let in checker.lets:
-            val = self._expr(let.value)
-            e.line(f"self.{let.name} = {val}")
-        e.dedent()
-        e.blank()
+# ═══════════════════════════════════════════════════════════════════════════
+# PATTERN COMPILER
+# ═══════════════════════════════════════════════════════════════════════════
 
-        # Helper: emit diagnostic
-        e.line("def _emit(self, error_id, message, file, linenr, column=0):")
-        e.indent()
-        e.line("if not _is_suppressed(error_id, file):")
-        e.indent()
-        e.line("_casl_emit(")
-        e.line("    error_id=error_id, message=message,")
-        e.line("    file=file, linenr=linenr, column=column,")
-        e.line("    severity=self.severity, cwe=self.cwe,")
-        e.line("    addon=self.addon_name, confidence=self.confidence,")
-        e.line(")")
-        e.line("self._diagnostics.append({")
-        e.line("    'errorId': error_id, 'message': message,")
-        e.line("    'file': file, 'linenr': linenr, 'column': column,")
-        e.line("})")
-        e.dedent()
-        e.dedent()
-        e.blank()
-
-        # Emit suppressions registration
-        for sup in checker.suppressions:
-            if sup.file_glob:
-                e.line(f"_FILE_SUPPRESSIONS[{repr(sup.error_id)}] = {repr(sup.file_glob)}")
+class PatternCompiler(ASTVisitor):
+    """Compile CASL code patterns to Python pattern matching code."""
+    
+    def __init__(self, context: "CompilationContext") -> None:
+        self.ctx = context
+        self._var_counter = 0
+    
+    def compile(self, pattern: A.CodePattern, func_name: str) -> str:
+        """Compile a pattern to a Python matching function."""
+        emitter = CodeEmitter()
+        
+        with emitter.block(f"def {func_name}(token, binding):"):
+            emitter.emit_docstring(f"Match pattern: {pattern}")
+            emitter.emit("bindings = dict(binding)")
+            emitter.emit_blank()
+            
+            # Generate matching code
+            match_code = self._compile_pattern(pattern, "token")
+            for line in match_code:
+                emitter.emit(line)
+            
+            emitter.emit_blank()
+            emitter.emit("return bindings")
+        
+        return emitter.get_code()
+    
+    def _compile_pattern(self, pattern: A.CodePattern, target: str) -> List[str]:
+        """Compile a pattern, returning lines of matching code."""
+        return self.visit(pattern, target)
+    
+    def _fresh_var(self, prefix: str = "tmp") -> str:
+        """Generate a fresh variable name."""
+        self._var_counter += 1
+        return f"_{prefix}_{self._var_counter}"
+    
+    def visit_wildcard_pattern(self, node: A.WildcardPattern, target: str) -> List[str]:
+        # Wildcard matches anything
+        return ["# wildcard - matches anything"]
+    
+    def visit_binding_pattern(self, node: A.BindingPattern, target: str) -> List[str]:
+        lines = []
+        var_name = node.name
+        
+        if node.type_constraint:
+            # Type check
+            type_check = self._compile_type_check(target, node.type_constraint)
+            lines.append(f"if not {type_check}:")
+            lines.append(f"    return None")
+        
+        lines.append(f"bindings[{repr(var_name)}] = {target}")
+        
+        if node.nested:
+            nested_lines = self._compile_pattern(node.nested, target)
+            lines.extend(nested_lines)
+        
+        return lines
+    
+    def visit_literal_pattern(self, node: A.LiteralPattern, target: str) -> List[str]:
+        value = repr(node.value)
+        return [
+            f"if not _match_literal({target}, {value}):",
+            f"    return None",
+        ]
+    
+    def visit_type_pattern(self, node: A.TypePattern, target: str) -> List[str]:
+        type_check = self._compile_type_check(target, node.type_name)
+        lines = [
+            f"if not {type_check}:",
+            f"    return None",
+        ]
+        
+        if node.nested:
+            nested_lines = self._compile_pattern(node.nested, target)
+            lines.extend(nested_lines)
+        
+        return lines
+    
+    def visit_node_pattern(self, node: A.NodePattern, target: str) -> List[str]:
+        lines = []
+        
+        # Check node kind
+        kind = node.kind
+        lines.append(f"if not _check_node_kind({target}, {repr(kind)}):")
+        lines.append(f"    return None")
+        
+        # Match children
+        for i, child in enumerate(node.children):
+            child_var = self._fresh_var("child")
+            lines.append(f"{child_var} = _get_child({target}, {i})")
+            lines.append(f"if {child_var} is None:")
+            lines.append(f"    return None")
+            child_lines = self._compile_pattern(child, child_var)
+            lines.extend(child_lines)
+        
+        # Match attributes
+        for attr_name, attr_pattern in node.attributes.items():
+            attr_var = self._fresh_var("attr")
+            lines.append(f"{attr_var} = _get_attr({target}, {repr(attr_name)})")
+            lines.append(f"if {attr_var} is None:")
+            lines.append(f"    return None")
+            attr_lines = self._compile_pattern(attr_pattern, attr_var)
+            lines.extend(attr_lines)
+        
+        return lines
+    
+    def visit_sequence_pattern(self, node: A.SequencePattern, target: str) -> List[str]:
+        """Compile PQL-style sequence patterns."""
+        lines = []
+        lines.append(f"# Sequence pattern with {len(node.elements)} elements")
+        lines.append(f"_seq_state = _init_sequence_match({target})")
+        
+        for i, elem in enumerate(node.elements):
+            if isinstance(elem, A.SequenceWildcard):
+                # Match zero or more tokens
+                if elem.binding:
+                    lines.append(f"_seq_state, bindings[{repr(elem.binding)}] = "
+                                f"_match_sequence_wildcard(_seq_state, greedy={elem.greedy})")
+                else:
+                    lines.append(f"_seq_state, _ = _match_sequence_wildcard(_seq_state, greedy={elem.greedy})")
             else:
-                e.line(f"_SUPPRESSIONS.add({repr(sup.error_id)})")
+                elem_var = self._fresh_var("seq_elem")
+                lines.append(f"{elem_var} = _seq_advance(_seq_state)")
+                lines.append(f"if {elem_var} is None:")
+                lines.append(f"    return None")
+                elem_lines = self._compile_pattern(elem, elem_var)
+                lines.extend(elem_lines)
+                lines.append(f"_seq_state = _seq_state._replace(pos=_seq_state.pos + 1)")
+        
+        return lines
+    
+    def visit_call_pattern(self, node: A.CallPattern, target: str) -> List[str]:
+        """Compile function call patterns."""
+        lines = []
+        lines.append(f"if not _is_call({target}):")
+        lines.append(f"    return None")
+        
+        if node.function:
+            func_var = self._fresh_var("callee")
+            lines.append(f"{func_var} = _get_callee({target})")
+            func_lines = self._compile_pattern(node.function, func_var)
+            lines.extend(func_lines)
+        
+        for i, arg in enumerate(node.arguments):
+            arg_var = self._fresh_var("arg")
+            lines.append(f"{arg_var} = _get_call_arg({target}, {i})")
+            lines.append(f"if {arg_var} is None:")
+            lines.append(f"    return None")
+            arg_lines = self._compile_pattern(arg, arg_var)
+            lines.extend(arg_lines)
+        
+        return lines
+    
+    def visit_assign_pattern(self, node: A.AssignPattern, target: str) -> List[str]:
+        """Compile assignment patterns."""
+        lines = []
+        lines.append(f"if not _is_assignment({target}):")
+        lines.append(f"    return None")
+        
+        if node.lhs:
+            lhs_var = self._fresh_var("lhs")
+            lines.append(f"{lhs_var} = _get_assign_lhs({target})")
+            lhs_lines = self._compile_pattern(node.lhs, lhs_var)
+            lines.extend(lhs_lines)
+        
+        if node.rhs:
+            rhs_var = self._fresh_var("rhs")
+            lines.append(f"{rhs_var} = _get_assign_rhs({target})")
+            rhs_lines = self._compile_pattern(node.rhs, rhs_var)
+            lines.extend(rhs_lines)
+        
+        return lines
+    
+    def visit_deref_pattern(self, node: A.DerefPattern, target: str) -> List[str]:
+        """Compile dereference patterns."""
+        lines = []
+        lines.append(f"if not _is_deref({target}):")
+        lines.append(f"    return None")
+        
+        if node.operand:
+            op_var = self._fresh_var("deref_op")
+            lines.append(f"{op_var} = _get_deref_operand({target})")
+            op_lines = self._compile_pattern(node.operand, op_var)
+            lines.extend(op_lines)
+        
+        return lines
+    
+    def _compile_type_check(self, target: str, type_name: str) -> str:
+        """Generate type checking code."""
+        type_map = {
+            "Token": "_is_token",
+            "Variable": "_is_variable",
+            "Function": "_is_function",
+            "Scope": "_is_scope",
+            "Number": "_is_number",
+            "Name": "_is_name",
+            "Op": "_is_op",
+        }
+        check_func = type_map.get(type_name, "_is_node_type")
+        if type_name in type_map:
+            return f"{check_func}({target})"
+        return f"{check_func}({target}, {repr(type_name)})"
+    
+    def generic_visit(self, node: A.ASTNode, target: str = "") -> List[str]:
+        return [f"# Unhandled pattern type: {type(node).__name__}"]
 
-        # Emit internal functions
-        for fn in checker.functions:
-            self._emit_method(fn)
 
-        # Emit pattern matching functions
-        for pat in checker.patterns:
-            self._emit_pattern_method(pat, checker)
+# ═══════════════════════════════════════════════════════════════════════════
+# CONSTRAINT COMPILER
+# ═══════════════════════════════════════════════════════════════════════════
 
-        # Emit query functions
-        for query in checker.queries:
-            self._emit_query_method(query)
+class ConstraintCompiler(ASTVisitor):
+    """Compile CASL constraints to Python predicates."""
+    
+    def __init__(self, context: "CompilationContext") -> None:
+        self.ctx = context
+        self.expr_compiler = ExpressionCompiler(context)
+    
+    def compile(self, constraint: A.Constraint) -> str:
+        """Compile a constraint to a Python expression."""
+        return self.visit(constraint)
+    
+    def visit_expr_constraint(self, node: A.ExprConstraint) -> str:
+        return self.expr_compiler.compile(node.expr)
+    
+    def visit_type_constraint(self, node: A.TypeConstraint) -> str:
+        target = self.expr_compiler.compile(node.target)
+        type_name = node.type_name
+        return f"_check_type({target}, {repr(type_name)})"
+    
+    def visit_flows_to(self, node: A.FlowsTo) -> str:
+        source = self.expr_compiler.compile(node.source)
+        sink = self.expr_compiler.compile(node.sink)
+        domain = repr(node.domain) if node.domain else "None"
+        return f"_flows_to({source}, {sink}, domain={domain}, state=_analysis_state)"
+    
+    def visit_reaches(self, node: A.Reaches) -> str:
+        source = self.expr_compiler.compile(node.source)
+        target = self.expr_compiler.compile(node.target)
+        return f"_reaches({source}, {target}, cfg=_cfg)"
+    
+    def visit_dominates(self, node: A.Dominates) -> str:
+        dominator = self.expr_compiler.compile(node.dominator)
+        dominated = self.expr_compiler.compile(node.dominated)
+        return f"_dominates({dominator}, {dominated}, dominators=_dominators)"
+    
+    def visit_same_value(self, node: A.SameValue) -> str:
+        left = self.expr_compiler.compile(node.left)
+        right = self.expr_compiler.compile(node.right)
+        return f"_same_value({left}, {right})"
+    
+    def visit_may_alias(self, node: A.MayAlias) -> str:
+        ptr1 = self.expr_compiler.compile(node.ptr1)
+        ptr2 = self.expr_compiler.compile(node.ptr2)
+        return f"_may_alias({ptr1}, {ptr2}, alias_info=_alias_info)"
+    
+    def visit_dataflow_fact(self, node: A.DataflowFact) -> str:
+        target = self.expr_compiler.compile(node.target)
+        fact = repr(node.fact)
+        domain = repr(node.domain) if node.domain else "None"
+        return f"_check_fact({target}, {fact}, domain={domain}, state=_analysis_state)"
+    
+    def visit_and_constraint(self, node: A.AndConstraint) -> str:
+        parts = [f"({self.visit(c)})" for c in node.constraints]
+        return " and ".join(parts)
+    
+    def visit_or_constraint(self, node: A.OrConstraint) -> str:
+        parts = [f"({self.visit(c)})" for c in node.constraints]
+        return " or ".join(parts)
+    
+    def visit_not_constraint(self, node: A.NotConstraint) -> str:
+        inner = self.visit(node.constraint)
+        return f"(not ({inner}))"
+    
+    def visit_forall_constraint(self, node: A.ForallConstraint) -> str:
+        var = CodeEmitter.make_identifier(node.variable)
+        collection = self.expr_compiler.compile(node.collection)
+        body = self.visit(node.body)
+        return f"all({body} for {var} in {collection})"
+    
+    def visit_exists_constraint(self, node: A.ExistsConstraint) -> str:
+        var = CodeEmitter.make_identifier(node.variable)
+        collection = self.expr_compiler.compile(node.collection)
+        body = self.visit(node.body)
+        return f"any({body} for {var} in {collection})"
+    
+    def generic_visit(self, node: A.ASTNode) -> str:
+        return "True  # unhandled constraint"
 
-        # run() method — orchestrates everything
-        e.line("def run(self, data):")
-        e.indent()
-        e.line('"""Run this checker on parsed cppcheck data."""')
-        e.line("for cfg in data.configurations:")
-        e.indent()
 
-        # init event
-        for ob in checker.on_blocks:
-            if ob.event == OnEvent.INIT:
-                e.comment(f"on init")
-                for stmt in ob.body:
-                    self._emit_stmt(stmt, receiver="self")
+# ═══════════════════════════════════════════════════════════════════════════
+# ACTION COMPILER
+# ═══════════════════════════════════════════════════════════════════════════
 
-        # cfg event
-        for ob in checker.on_blocks:
-            if ob.event == OnEvent.CFG:
-                e.comment(f"on cfg")
-                e.line("_cfg = cfg")
-                for stmt in ob.body:
-                    self._emit_stmt(stmt, receiver="self")
-
-        # token iteration
-        token_blocks = [ob for ob in checker.on_blocks if ob.event == OnEvent.TOKEN]
-        token_patterns = checker.patterns
-        if token_blocks or token_patterns:
-            e.line("for tok in _iter_tokens(cfg):")
-            e.indent()
-            for ob in token_blocks:
-                for stmt in ob.body:
-                    self._emit_stmt(stmt, receiver="self")
-            for pat in token_patterns:
-                e.line(f"self._pattern_{pat.name}(tok)")
-            e.dedent()
-
-        # scope iteration
-        scope_blocks = [ob for ob in checker.on_blocks if ob.event == OnEvent.SCOPE]
-        if scope_blocks:
-            e.line("for scope in _iter_scopes(cfg):")
-            e.indent()
-            for ob in scope_blocks:
-                for stmt in ob.body:
-                    self._emit_stmt(stmt, receiver="self")
-            e.dedent()
-
-        # function iteration
-        fn_blocks = [ob for ob in checker.on_blocks if ob.event == OnEvent.FUNCTION]
-        if fn_blocks:
-            e.line("for func in _iter_functions(cfg):")
-            e.indent()
-            for ob in fn_blocks:
-                for stmt in ob.body:
-                    self._emit_stmt(stmt, receiver="self")
-            e.dedent()
-
-        # variable iteration
-        var_blocks = [ob for ob in checker.on_blocks if ob.event == OnEvent.VARIABLE]
-        if var_blocks:
-            e.line("for var in _iter_variables(cfg):")
-            e.indent()
-            for ob in var_blocks:
-                for stmt in ob.body:
-                    self._emit_stmt(stmt, receiver="self")
-            e.dedent()
-
-        # finish event
-        for ob in checker.on_blocks:
-            if ob.event == OnEvent.FINISH:
-                e.comment(f"on finish")
-                for stmt in ob.body:
-                    self._emit_stmt(stmt, receiver="self")
-
-        e.dedent()  # for cfg
-        e.line("return self._diagnostics")
-        e.dedent()  # def run
-
-        e.dedent()  # class
-        e.blank()
-
-    def _emit_method(self, fn: FnDecl):
-        e = self.e
-        params = ["self"] + [p.name for p in fn.params]
-        params_str = ", ".join(params)
-        e.line(f"def {fn.name}({params_str}):")
-        e.indent()
-        if fn.docstring:
-            e.docstring(fn.docstring)
-        if not fn.body:
-            e.line("pass")
+class ActionCompiler(ASTVisitor):
+    """Compile CASL actions to Python code."""
+    
+    def __init__(self, context: "CompilationContext") -> None:
+        self.ctx = context
+        self.expr_compiler = ExpressionCompiler(context)
+    
+    def compile(self, action: A.Action) -> List[str]:
+        """Compile an action to Python statements."""
+        return self.visit(action)
+    
+    def visit_report_action(self, node: A.ReportAction) -> List[str]:
+        severity = node.severity or "warning"
+        message = self.expr_compiler.compile(node.message)
+        
+        lines = []
+        if node.location:
+            location = self.expr_compiler.compile(node.location)
+            lines.append(f"_report({repr(severity)}, {message}, {location})")
         else:
-            for stmt in fn.body:
-                self._emit_stmt(stmt, receiver="self")
-        e.dedent()
-        e.blank()
-
-    def _emit_pattern_method(self, pat: PatternDecl, checker: CheckerDecl):
-        e = self.e
-        params = ["self", "tok"] + [p.name for p in pat.params]
-        params_str = ", ".join(params)
-        e.line(f"def _pattern_{pat.name}({params_str}):")
-        e.indent()
-        if pat.docstring:
-            e.docstring(pat.docstring)
-
-        # Generate match conditions
-        match_conditions = []
-        where_conditions = []
-        ensures_conditions = []
-
-        for clause in pat.clauses:
-            if isinstance(clause, PatternClauseMatch):
-                cond = self._pattern_expr_to_condition(clause.pattern, "tok")
-                match_conditions.append(cond)
-            elif isinstance(clause, PatternClauseWhere):
-                where_conditions.append(self._expr(clause.condition))
-            elif isinstance(clause, PatternClauseEnsures):
-                ensures_conditions.append(self._expr(clause.condition))
-
-        # Build combined condition
-        all_conds = match_conditions + where_conditions
-        if all_conds:
-            combined = " and ".join(f"({c})" for c in all_conds)
-            e.line(f"if {combined}:")
-            e.indent()
-            # Default action: emit diagnostic
-            eid = checker.error_id or checker.name
-            e.line(f"self._emit(")
-            e.line(f"    {repr(eid)},")
-            e.line(f"    f'Pattern {repr(pat.name)} matched at {{getattr(tok, \"file\", \"?\")}}:{{getattr(tok, \"linenr\", 0)}}',")
-            e.line(f"    getattr(tok, 'file', ''),")
-            e.line(f"    getattr(tok, 'linenr', 0),")
-            e.line(f"    getattr(tok, 'column', 0),")
-            e.line(f")")
-            e.dedent()
-        else:
-            e.line("pass")
-        e.dedent()
-        e.blank()
-
-    def _emit_query_method(self, query: QueryDecl):
-        e = self.e
-        params = ["self"] + [p.name for p in query.params]
-        params_str = ", ".join(params)
-        e.line(f"def _query_{query.name}({params_str}):")
-        e.indent()
-        if query.docstring:
-            e.docstring(query.docstring)
-        if not query.body:
-            e.line("return None")
-        else:
-            for stmt in query.body:
-                self._emit_stmt(stmt, receiver="self")
-        e.dedent()
-        e.blank()
-
-    # ── Pattern → Python condition ───────────────────────────────
-
-    def _pattern_expr_to_condition(self, pat, var_name: str) -> str:
-        if isinstance(pat, TokenPattern):
-            parts = []
-            for key, val in pat.constraints.items():
-                val_str = self._expr(val)
-                parts.append(f"getattr({var_name}, {repr(key)}, None) == {val_str}")
-            return " and ".join(parts) if parts else "True"
-
-        elif isinstance(pat, ScopePattern):
-            return (f"getattr(getattr({var_name}, 'scope', None), "
-                    f"'type', None) == {repr(pat.name)}")
-
-        elif isinstance(pat, CallPattern):
-            callee_str = self._expr(pat.callee)
-            return f"_is_call_to({var_name}, {callee_str})"
-
-        elif isinstance(pat, AssignPattern):
-            lhs_cond = self._pattern_expr_to_condition(pat.lhs, var_name)
-            return (f"getattr({var_name}, 'isAssignmentOp', False) "
-                    f"and {lhs_cond}")
-
-        elif isinstance(pat, DerefPattern):
-            inner = self._pattern_expr_to_condition(pat.operand, var_name)
-            return (f"getattr({var_name}, 'str', None) == '*' "
-                    f"and getattr({var_name}, 'isOp', False) "
-                    f"and {inner}")
-
-        elif isinstance(pat, BinopPattern):
-            return (f"getattr({var_name}, 'str', None) == {repr(pat.op)} "
-                    f"and getattr({var_name}, 'isBinaryOp', lambda: False)()")
-
-        elif isinstance(pat, WildcardPattern):
-            return "True"
-
-        return "True"
-
-    # ── Statement emission ───────────────────────────────────────
-
-    def _emit_stmt(self, stmt, receiver: Optional[str] = None):
-        e = self.e
-
-        if isinstance(stmt, LetStmt):
-            val = self._expr(stmt.value)
-            e.line(f"{stmt.name} = {val}")
-
-        elif isinstance(stmt, AssignStmt):
-            target = self._expr(stmt.target)
-            val = self._expr(stmt.value)
-            e.line(f"{target} {_py_assign_op(stmt.op)} {val}")
-
-        elif isinstance(stmt, IfStmt):
-            cond = self._expr(stmt.condition)
-            e.line(f"if {cond}:")
-            e.indent()
-            if not stmt.then_body:
-                e.line("pass")
-            for s in stmt.then_body:
-                self._emit_stmt(s, receiver)
-            e.dedent()
-            for elif_cond, elif_body in stmt.elif_clauses:
-                ec = self._expr(elif_cond)
-                e.line(f"elif {ec}:")
-                e.indent()
-                if not elif_body:
-                    e.line("pass")
-                for s in elif_body:
-                    self._emit_stmt(s, receiver)
-                e.dedent()
-            if stmt.else_body is not None:
-                e.line("else:")
-                e.indent()
-                if not stmt.else_body:
-                    e.line("pass")
-                for s in stmt.else_body:
-                    self._emit_stmt(s, receiver)
-                e.dedent()
-
-        elif isinstance(stmt, ForStmt):
-            it = self._expr(stmt.iterable)
-            e.line(f"for {stmt.var} in {it}:")
-            e.indent()
-            if not stmt.body:
-                e.line("pass")
-            for s in stmt.body:
-                self._emit_stmt(s, receiver)
-            e.dedent()
-
-        elif isinstance(stmt, WhileStmt):
-            cond = self._expr(stmt.condition)
-            e.line(f"while {cond}:")
-            e.indent()
-            if not stmt.body:
-                e.line("pass")
-            for s in stmt.body:
-                self._emit_stmt(s, receiver)
-            e.dedent()
-
-        elif isinstance(stmt, ReturnStmt):
-            if stmt.value is not None:
-                val = self._expr(stmt.value)
-                e.line(f"return {val}")
-            else:
-                e.line("return")
-
-        elif isinstance(stmt, EmitStmt):
-            # emit errorId(message, file, linenr, column)
-            args_str = ", ".join(self._expr(a) for a in stmt.args)
-            if receiver:
-                e.line(f"{receiver}._emit({repr(stmt.error_id)}, {args_str})")
-            else:
-                e.line(f"_casl_emit({repr(stmt.error_id)}, {args_str})")
-
-        elif isinstance(stmt, BreakStmt):
-            e.line("break")
-
-        elif isinstance(stmt, ContinueStmt):
-            e.line("continue")
-
-        elif isinstance(stmt, ExprStmt):
-            val = self._expr(stmt.expr)
-            e.line(val)
-
-    # ── Expression emission ──────────────────────────────────────
-
-    def _expr(self, expr) -> str:
-        if expr is None:
-            return "None"
-
-        if isinstance(expr, Identifier):
-            return expr.name
-
-        if isinstance(expr, IntLiteral):
-            return repr(expr.value)
-
-        if isinstance(expr, FloatLiteral):
-            return repr(expr.value)
-
-        if isinstance(expr, StringLiteral):
-            return repr(expr.value)
-
-        if isinstance(expr, BoolLiteral):
-            return "True" if expr.value else "False"
-
-        if isinstance(expr, NullLiteral):
-            return "None"
-
-        if isinstance(expr, ListLiteral):
-            elems = ", ".join(self._expr(e) for e in expr.elements)
-            return f"[{elems}]"
-
-        if isinstance(expr, MapLiteral):
-            entries = ", ".join(
-                f"{self._expr(k)}: {self._expr(v)}" for k, v in expr.entries
-            )
-            return f"{{{entries}}}"
-
-        if isinstance(expr, SetLiteral):
-            elems = ", ".join(self._expr(e) for e in expr.elements)
-            return f"set([{elems}])" if elems else "set()"
-
-        if isinstance(expr, UnaryExpr):
-            operand = self._expr(expr.operand)
-            return f"({_py_unary(expr.op)}{operand})"
-
-        if isinstance(expr, BinaryExpr):
-            left = self._expr(expr.left)
-            right = self._expr(expr.right)
-            return f"({left} {_py_op(expr.op)} {right})"
-
-        if isinstance(expr, TernaryExpr):
-            then = self._expr(expr.then_expr)
-            cond = self._expr(expr.condition)
-            els = self._expr(expr.else_expr)
-            return f"({then} if {cond} else {els})"
-
-        if isinstance(expr, CallExpr):
-            callee = self._expr(expr.callee)
-            args = ", ".join(self._expr(a) for a in expr.args)
-            return f"{callee}({args})"
-
-        if isinstance(expr, IndexExpr):
-            obj = self._expr(expr.obj)
-            idx = self._expr(expr.index)
-            return f"{obj}[{idx}]"
-
-        if isinstance(expr, MemberExpr):
-            obj = self._expr(expr.obj)
-            return f"{obj}.{expr.member}"
-
-        if isinstance(expr, MethodCallExpr):
-            obj = self._expr(expr.obj)
-            args = ", ".join(self._expr(a) for a in expr.args)
-            return f"{obj}.{expr.method}({args})"
-
-        if isinstance(expr, LambdaExpr):
-            params = ", ".join(p.name for p in expr.params)
-            # For simple lambdas (single return), use Python lambda
-            if len(expr.body) == 1 and isinstance(expr.body[0], ReturnStmt):
-                val = self._expr(expr.body[0].value)
-                return f"(lambda {params}: {val})"
-            # For complex lambdas, we need a local function
-            # This is a simplification — full implementation would use
-            # a generated function name
-            if len(expr.body) == 1 and isinstance(expr.body[0], ExprStmt):
-                val = self._expr(expr.body[0].expr)
-                return f"(lambda {params}: {val})"
-            return f"(lambda {params}: None)  # complex lambda — see source"
-
-        if isinstance(expr, MatchExpr):
-            # Compile to a series of if/elif
-            subject = self._expr(expr.subject)
-            # Use a helper
-            return f"_casl_match({subject}, {self._match_arms_dict(expr.arms)})"
-
-        # Fallback
-        return repr(str(expr))
-
-    def _match_arms_dict(self, arms: list[MatchArm]) -> str:
-        entries = []
-        default = "None"
-        for arm in arms:
-            pat = arm.pattern
-            body = self._expr(arm.body)
-            if isinstance(pat, Identifier) and pat.name == "_":
-                default = body
-            else:
-                key = self._expr(pat)
-                entries.append(f"{key}: (lambda: {body})")
-        dict_str = "{" + ", ".join(entries) + "}"
-        return f"({dict_str}.get({self._expr(arms[0].pattern) if arms else 'None'}, lambda: {default})())"
-
-    # ── Main entry point ─────────────────────────────────────────
-
-    def _emit_main(self):
-        e = self.e
-
-        # match helper
-        e.line("def _casl_match(subject, dispatch):")
-        e.indent()
-        e.line('"""Runtime match expression helper."""')
-        e.line("if isinstance(dispatch, dict):")
-        e.indent()
-        e.line("fn = dispatch.get(subject)")
-        e.line("if fn is not None:")
-        e.indent()
-        e.line("return fn() if callable(fn) else fn")
-        e.dedent()
-        e.line("# Try wildcard")
-        e.line("fn = dispatch.get('_')")
-        e.line("if fn is not None:")
-        e.indent()
-        e.line("return fn() if callable(fn) else fn")
-        e.dedent()
-        e.dedent()
-        e.line("return None")
-        e.dedent()
-        e.blank()
-
-        # main
-        e.line("def main():")
-        e.indent()
-        addon_name = self.program.addon.name if self.program.addon else "casl_addon"
-        e.docstring(f"Entry point for {addon_name} cppcheck addon.")
-        e.blank()
-
-        e.line("parser = argparse.ArgumentParser(")
-        e.line(f"    description={repr(addon_name + ' - CASL-generated cppcheck addon')}")
-        e.line(")")
-        e.line("parser.add_argument('dumpfile', help='Path to cppcheck .dump file')")
-        e.line("parser.add_argument('--cli', action='store_true',")
-        e.line("                    help='Output in cppcheck JSON protocol')")
-        e.line("parser.add_argument('--suppress', nargs='*', default=[],")
-        e.line("                    help='Error IDs to suppress')")
-        e.line("args, unknown = parser.parse_known_args()")
-        e.blank()
-        e.line("global _CLI_MODE")
-        e.line("_CLI_MODE = args.cli or _CLI_MODE")
-        e.blank()
-        e.line("for s in args.suppress:")
-        e.indent()
-        e.line("_SUPPRESSIONS.add(s)")
-        e.dedent()
-        e.blank()
-
-        e.line("data = parsedump(args.dumpfile)")
-        e.blank()
-
-        e.line("all_diagnostics = []")
-        for cn in self._checker_names:
-            e.line(f"checker = {cn}()")
-            e.line(f"diags = checker.run(data)")
-            e.line(f"all_diagnostics.extend(diags)")
-        e.blank()
-
-        e.line("if not _CLI_MODE and all_diagnostics:")
-        e.indent()
-        e.line(f"sys.stderr.write(f'\\n{repr(addon_name)}: "
-               f"{{len(all_diagnostics)}} issue(s) found.\\n')")
-        e.dedent()
-        e.blank()
-        e.line("sys.exit(1 if all_diagnostics else 0)")
-        e.dedent()
-        e.blank()
-        e.blank()
-        e.line("if __name__ == '__main__':")
-        e.indent()
-        e.line("main()")
-        e.dedent()
+            lines.append(f"_report({repr(severity)}, {message}, _current_token)")
+        
+        return lines
+    
+    def visit_set_fact_action(self, node: A.SetFactAction) -> List[str]:
+        target = self.expr_compiler.compile(node.target)
+        value = self.expr_compiler.compile(node.value)
+        domain = repr(node.domain) if node.domain else "None"
+        return [f"_set_fact({target}, {value}, domain={domain}, state=_analysis_state)"]
+    
+    def visit_log_action(self, node: A.LogAction) -> List[str]:
+        level = node.level or "debug"
+        message = self.expr_compiler.compile(node.message)
+        return [f"_log({repr(level)}, {message})"]
+    
+    def visit_store_action(self, node: A.StoreAction) -> List[str]:
+        key = self.expr_compiler.compile(node.key)
+        value = self.expr_compiler.compile(node.value)
+        return [f"_store[{key}] = {value}"]
+    
+    def visit_sequence_action(self, node: A.SequenceAction) -> List[str]:
+        lines = []
+        for action in node.actions:
+            lines.extend(self.visit(action))
+        return lines
+    
+    def visit_cond_action(self, node: A.CondAction) -> List[str]:
+        cond = self.expr_compiler.compile(node.condition)
+        lines = [f"if {cond}:"]
+        
+        then_lines = self.visit(node.then_action)
+        for line in then_lines:
+            lines.append(f"    {line}")
+        
+        if node.else_action:
+            lines.append("else:")
+            else_lines = self.visit(node.else_action)
+            for line in else_lines:
+                lines.append(f"    {line}")
+        
+        return lines
+    
+    def visit_foreach_action(self, node: A.ForeachAction) -> List[str]:
+        var = CodeEmitter.make_identifier(node.variable)
+        collection = self.expr_compiler.compile(node.collection)
+        
+        lines = [f"for {var} in {collection}:"]
+        body_lines = self.visit(node.body)
+        for line in body_lines:
+            lines.append(f"    {line}")
+        
+        return lines
+    
+    def generic_visit(self, node: A.ASTNode) -> List[str]:
+        return [f"pass  # unhandled action: {type(node).__name__}"]
 
 
-def generate(program: Program, source_filename: str = "<casl>") -> str:
-    """Generate Python addon source from a CASL AST."""
-    gen = CodeGenerator(program, source_filename)
-    return gen.generate()
+# ═══════════════════════════════════════════════════════════════════════════
+# COMPILATION CONTEXT
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class CompilationContext:
+    """Context for code generation."""
+    
+    semantic_ctx: SemanticContext
+    emitter: CodeEmitter
+    
+    # Tracked state
+    pattern_variables: Set[str] = field(default_factory=set)
+    local_variables: Set[str] = field(default_factory=set)
+    domain_values: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+    generated_functions: Dict[str, str] = field(default_factory=dict)
+    
+    # Collected information
+    required_imports: Set[str] = field(default_factory=set)
+    required_domains: Set[str] = field(default_factory=set)
+    required_analyses: Set[str] = field(default_factory=set)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN CODE GENERATOR
+# ═══════════════════════════════════════
