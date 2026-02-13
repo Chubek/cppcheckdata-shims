@@ -1,0 +1,13 @@
+# =============================================================================
+# cppcheckdata-shims — Core runtime dependencies
+# =============================================================================
+# Install with:  pip install -r requirements.txt
+# =============================================================================
+
+# PEG parser — powers all three DSLs (CASL / CCPL / CCQL grammars)
+# Used by: dsl/casl.py, dsl/ccpl.py, dsl/ccql.py
+parsimonious>=0.10.0
+
+# S-expression parser/serializer — dump2sexp output, CASL IR serialization
+# Used by: scripts/dump2sexp.py, dsl/casl.py
+sexpdata>=1.0.0

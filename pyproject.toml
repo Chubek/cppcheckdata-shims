@@ -1,0 +1,321 @@
+# =============================================================================
+# cppcheckdata-shims
+#
+# A semantic middle layer that transforms cppcheck's dump IR into a full
+# static-analysis infrastructure: CFGs, dataflow engines, abstract
+# interpretation, constraint solving, symbolic execution, call graphs,
+# memory abstraction, quality scoring, and three DSLs (CASL/CCPL/CCQL).
+#
+# Project layout (from repository tree):
+#
+#   cppcheckdata-shims/
+#   ├── cppcheckdata_shims/        # Core library package
+#   │   ├── __init__.py
+#   │   ├── abstract_interp.py     # Abstract interpretation framework
+#   │   ├── callgraph.py           # Inter-procedural call graph construction
+#   │   ├── constraint_engine.py   # Constraint accumulation & solving
+#   │   ├── ctrlflow_graph.py      # Control flow graph construction
+#   │   ├── dataflow_engine.py     # Generic fixpoint dataflow engine
+#   │   ├── memory_abstraction.py  # Heap/stack memory models
+#   │   ├── qscore.py              # Quality scoring (6 dimensions, 28 metrics)
+#   │   └── symbolic_exec.py       # Symbolic execution engine
+#   ├── dsl/                       # Domain-specific languages
+#   │   ├── __init__.py
+#   │   ├── casl.py                # Cppcheck Analysis Specification Language
+#   │   ├── ccpl.py                # Cppcheck Code Pattern Language
+#   │   └── ccql.py                # Cppcheck Code Query Language
+#   ├── deps/                      # Vendored / pinned dependencies
+#   │   ├── cppcheckdata.py        # Upstream cppcheckdata (unmodified)
+#   │   ├── cppcheck.py            # Cppcheck invocation wrapper
+#   │   └── runaddon.py            # Addon runner harness
+#   ├── doc/                       # Documentation
+#   │   ├── MEMORY_ADDONS.md
+#   │   ├── SAFETY_ADDONS.md
+#   │   ├── SCOPE_ADDONS.md
+#   │   ├── STYLE_ADDONS.md
+#   │   └── VADE_MECUM.md
+#   ├── examples/
+#   │   └── shims/
+#   │       ├── buffer-overflow.py
+#   │       └── use-after-free.py
+#   ├── scripts/
+#   │   ├── dump2dot.py            # Dump → Graphviz DOT converter
+#   │   └── dump2sexp.py           # Dump → S-expression converter
+#   ├── tests/                     # ~599 tests
+#   ├── pyproject.toml             # ← this file
+#   ├── setup.py                   # Legacy/editable install support
+#   └── README.md
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Build system (PEP 517 / PEP 518)
+# ---------------------------------------------------------------------------
+[build-system]
+requires = ["setuptools>=70.0", "wheel>=0.43"]
+build-backend = "setuptools.build_meta"
+
+
+# ---------------------------------------------------------------------------
+# Project metadata (PEP 621)
+# ---------------------------------------------------------------------------
+[project]
+name = "cppcheckdata-shims"
+version = "0.1.0"
+description = """\
+    Semantic middle layer that lifts cppcheck dump IR into full static-analysis \
+    infrastructure: CFGs, dataflow engines, abstract interpretation, constraint \
+    solving, symbolic execution, call graphs, memory abstraction, quality \
+    scoring, and three DSLs (CASL / CCPL / CCQL).\
+"""
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "cppcheckdata-shims contributors"},
+]
+keywords = [
+    "cppcheck",
+    "static-analysis",
+    "abstract-interpretation",
+    "dataflow",
+    "cfg",
+    "control-flow-graph",
+    "symbolic-execution",
+    "quality-score",
+    "program-analysis",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+# ---- Runtime dependencies --------------------------------------------------
+dependencies = [
+    # PEG parser for DSLs (CASL / CCPL / CCQL grammars)
+    "parsimonious>=0.10.0",
+
+    # S-expression serialization (used by dump2sexp and CASL IR)
+    "sexpdata>=1.0.0",
+
+    # XML processing (stdlib, but listed for documentation clarity)
+    # xml.etree.ElementTree is used by cppcheckdata.py — no extra dep needed
+]
+
+# ---- Optional / extra dependencies ----------------------------------------
+[project.optional-dependencies]
+# Everything needed to run the test suite
+test = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-timeout>=2.3",
+    "hypothesis>=6.100",       # Property-based testing for lattice laws
+]
+
+# Documentation generation
+docs = [
+    "sphinx>=7.0",
+    "sphinx-rtd-theme>=2.0",
+    "myst-parser>=3.0",        # Markdown in Sphinx
+]
+
+# Visualization (DOT export, CFG rendering)
+viz = [
+    "graphviz>=0.20",
+    "pygraphviz>=1.12",
+]
+
+# Development (linting, formatting, type checking)
+dev = [
+    "cppcheckdata-shims[test,docs,viz]",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+]
+
+# Full installation: everything
+all = [
+    "cppcheckdata-shims[dev]",
+]
+
+
+# ---- Entry points ----------------------------------------------------------
+[project.scripts]
+# CLI tools installed into PATH
+ccs-qscore    = "cppcheckdata_shims.qscore:main"
+ccs-dump2dot  = "scripts.dump2dot:main"
+ccs-dump2sexp = "scripts.dump2sexp:main"
+
+[project.entry-points."cppcheckdata_shims.dsl"]
+# Plugin-style DSL registration
+casl = "dsl.casl:CASLEngine"
+ccpl = "dsl.ccpl:CCPLEngine"
+ccql = "dsl.ccql:CCQLEngine"
+
+
+# ---- URLs ------------------------------------------------------------------
+[project.urls]
+Homepage    = "https://github.com/cppcheckdata-shims/cppcheckdata-shims"
+Repository  = "https://github.com/cppcheckdata-shims/cppcheckdata-shims"
+Issues      = "https://github.com/cppcheckdata-shims/cppcheckdata-shims/issues"
+Documentation = "https://cppcheckdata-shims.readthedocs.io/"
+
+
+# ---------------------------------------------------------------------------
+# Tool configuration
+# ---------------------------------------------------------------------------
+
+# ---- setuptools ------------------------------------------------------------
+[tool.setuptools]
+# Ensure deps/ is included as a namespace so vendored cppcheckdata is importable
+# when not installed system-wide.
+zip-safe = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "cppcheckdata_shims",
+    "cppcheckdata_shims.*",
+    "dsl",
+    "dsl.*",
+    "deps",
+    "deps.*",
+    "scripts",
+    "scripts.*",
+]
+exclude = [
+    "tests",
+    "tests.*",
+    "env",
+    "env.*",
+    "examples",
+    "examples.*",
+]
+
+[tool.setuptools.package-data]
+# Include any grammar files, schema files, or data bundled with DSLs
+"dsl" = ["*.peg", "*.grammar", "*.schema"]
+"cppcheckdata_shims" = ["py.typed"]
+
+
+# ---- pytest ----------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--strict-markers",
+    "--tb=short",
+    "-q",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: requires cppcheck binary on PATH",
+    "lattice: abstract domain lattice law tests",
+    "dataflow: dataflow engine tests",
+    "cfg: control flow graph tests",
+    "callgraph: call graph tests",
+    "memory: memory abstraction tests",
+    "symbolic: symbolic execution tests",
+    "constraint: constraint engine tests",
+    "qscore: quality scoring tests",
+    "casl: CASL DSL tests",
+    "ccpl: CCPL pattern language tests",
+    "ccql: CCQL query language tests",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:parsimonious.*",
+]
+
+
+# ---- coverage --------------------------------------------------------------
+[tool.coverage.run]
+source = ["cppcheckdata_shims", "dsl"]
+branch = true
+omit = [
+    "tests/*",
+    "deps/*",
+    "env/*",
+    "examples/*",
+    "scripts/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 85
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@abstractmethod",
+]
+
+
+# ---- mypy ------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_reexport = true
+
+[[tool.mypy.overrides]]
+module = [
+    "cppcheckdata",
+    "cppcheckdata.*",
+    "parsimonious",
+    "parsimonious.*",
+    "sexpdata",
+    "sexpdata.*",
+]
+ignore_missing_imports = true
+
+
+# ---- ruff ------------------------------------------------------------------
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",       # pycodestyle errors
+    "W",       # pycodestyle warnings
+    "F",       # pyflakes
+    "I",       # isort
+    "N",       # pep8-naming
+    "UP",      # pyupgrade
+    "B",       # flake8-bugbear
+    "SIM",     # flake8-simplify
+    "TCH",     # flake8-type-checking
+    "RUF",     # ruff-specific rules
+]
+ignore = [
+    "E501",    # line too long (handled by formatter)
+    "B008",    # do not perform function call in argument defaults
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cppcheckdata_shims", "dsl", "deps"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
