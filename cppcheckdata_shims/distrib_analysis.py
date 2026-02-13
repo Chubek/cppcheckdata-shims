@@ -23,7 +23,7 @@ This module does NOT reimplement what already exists:
     - Call graphs come from callgraph
     - Abstract domains come from abstract_domains
     - The intraprocedural worklist engine comes from dataflow_engine
-    - Base analysis classes come from dataflow_analyses
+    - Base analysis classes come from dataflow_analysis
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ from typing import (
 # ── Imports from existing shim modules (NO duplication) ──────────────
 from cppcheckdata_shims.ctrlflow_graph import BasicBlock, CFG, build_cfg_for_function, build_all_cfgs
 from cppcheckdata_shims.callgraph import CallGraph, CallSite, build_call_graph
-from cppcheckdata_shims.dataflow_analyses import ForwardAnalysis
+from cppcheckdata_shims.dataflow_analysis import ForwardAnalysis
 from cppcheckdata_shims.dataflow_engine import WorklistSolver
 from cppcheckdata_shims.abstract_domains import PowersetDomain
 
@@ -891,7 +891,7 @@ class TopMicro(MicroFunction):
 class LinearMicro(MicroFunction):
     """
     f(v) = a * v + b (over integers/numeric lattice).
-    Useful for induction variable and linear propagation analyses.
+    Useful for induction variable and linear propagation analysis.
 
     Composition: (a₁·(a₂·v + b₂) + b₁) = (a₁·a₂)·v + (a₁·b₂ + b₁)
     """
@@ -1189,7 +1189,7 @@ class IDESolver(Generic[D, V]):
 # =====================================================================
 
 # These are ready-to-use IFDS problems built on the framework above,
-# instantiating the abstract flow-function factories for common analyses.
+# instantiating the abstract flow-function factories for common analysis.
 
 
 @dataclass(frozen=True)
@@ -1324,7 +1324,7 @@ class TaintIFDS(IFDSProblem[TaintFact]):
     Fact tainted(v) ∈ result(n) means v may hold user-controlled data at n.
 
     This is a *distributive* reformulation of the set-based taint analysis
-    from dataflow_analyses.py, now interprocedural and context-sensitive
+    from dataflow_analysis.py, now interprocedural and context-sensitive
     via the IFDS framework.
     """
 

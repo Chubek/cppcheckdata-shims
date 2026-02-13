@@ -1,16 +1,16 @@
-# cppcheckdata_shims/ctrlflow_analyses.py
+# cppcheckdata_shims/ctrlflow_analysis.py
 """
-Control-flow analyses for cppcheckdata-shims.
+Control-flow analysis for cppcheckdata-shims.
 
-This module provides analyses that reason about the *structure* of control
+This module provides analysis that reason about the *structure* of control
 flow—loops, paths, dominance, reachability—rather than propagating abstract
-data values (which is the job of dataflow_analyses.py).
+data values (which is the job of dataflow_analysis.py).
 
-All analyses consume the CFG representation from ctrlflow_graph.py and
+All analysis consume the CFG representation from ctrlflow_graph.py and
 optionally exploit cppcheckdata.Configuration.ValueFlow for path-condition
 pruning, loop-bound estimation, and invariant detection.
 
-Principal analyses
+Principal analysis
 ------------------
 - DominatorTree / PostDominatorTree
 - NaturalLoopDetector
@@ -25,7 +25,7 @@ Principal analyses
 Usage example (loop-invariant warning)
 --------------------------------------
     from cppcheckdata_shims.ctrlflow_graph import build_cfg
-    from cppcheckdata_shims.ctrlflow_analyses import (
+    from cppcheckdata_shims.ctrlflow_analysis import (
         NaturalLoopDetector, LoopInvariantAnalysis,
     )
 
@@ -2096,22 +2096,22 @@ def _get_tok_id(tok: Any) -> Any:
 # Convenience orchestrator
 # ===================================================================
 
-def run_all_ctrlflow_analyses(
+def run_all_ctrlflow_analysis(
     cfg: Cfg,
     configuration: Optional[Configuration] = None,
     *,
-    analyses: Optional[Set[str]] = None,
+    analysis: Optional[Set[str]] = None,
     k_limit: int = 32,
     max_unroll: int = 2,
 ) -> Dict[str, Any]:
     """
-    Run all (or selected) control-flow analyses on a CFG.
+    Run all (or selected) control-flow analysis on a CFG.
 
     Parameters
     ----------
     cfg            : control-flow graph from ctrlflow_graph.py
     configuration  : cppcheckdata.Configuration
-    analyses       : set of analysis names to run, or None for all.
+    analysis       : set of analysis names to run, or None for all.
                      Valid names: "dominators", "post_dominators", "loops",
                      "loop_invariants", "induction_vars", "loop_bounds",
                      "path_sensitive", "path_feasibility", "correlations",
@@ -2128,7 +2128,7 @@ def run_all_ctrlflow_analyses(
         "induction_vars", "loop_bounds", "path_sensitive",
         "path_feasibility", "correlations", "unreachable",
     }
-    wanted = analyses if analyses is not None else ALL
+    wanted = analysis if analysis is not None else ALL
     results: Dict[str, Any] = {}
 
     # Dominators (many others depend on this)

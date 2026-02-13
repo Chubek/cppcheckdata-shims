@@ -1,10 +1,10 @@
 """
-cppcheckdata_shims/dataflow_analyses.py
+cppcheckdata_shims/dataflow_analysis.py
 ═══════════════════════════════════════
 
-Ready-made dataflow analyses built on ``dataflow_engine.py``.
+Ready-made dataflow analysis built on ``dataflow_engine.py``.
 
-Provided analyses
+Provided analysis
 ─────────────────
   1. ReachingDefinitions     — forward, may (gen/kill)
   2. AvailableExpressions    — forward, must
@@ -27,11 +27,11 @@ a clean query API after ``run()``.
 
 Integration with cppcheck's ValueFlow
 ──────────────────────────────────────
-Where possible, analyses consult ``token.values`` (the ``ValueFlow``
+Where possible, analysis consult ``token.values`` (the ``ValueFlow``
 list attached to each Token by cppcheck) to:
   - seed initial abstract values (IntervalAnalysis, ConstantPropagation)
   - resolve pointer targets (PointerAnalysis)
-  - prune infeasible branches (all forward analyses)
+  - prune infeasible branches (all forward analysis)
 
 This avoids re-deriving information that cppcheck's C++ engine already
 computed, while still allowing the Python-side analysis to go further
@@ -117,7 +117,7 @@ from cppcheckdata_shims.abstract_domains import (
 #
 #  This is intentionally simpler than the full ``ctrlflow_graph.py``
 #  module (which handles irreducible graphs, exceptions, longjmp, etc.)
-#  — the analyses below need only a standard reducible CFG.
+#  — the analysis below need only a standard reducible CFG.
 # ═════════════════════════════════════════════════════════════════════════
 
 BlockId = int
@@ -170,7 +170,7 @@ class SimpleCFG:
 
     @property
     def reverse_postorder(self) -> List[BlockId]:
-        """Compute reverse post-order traversal (good for forward analyses)."""
+        """Compute reverse post-order traversal (good for forward analysis)."""
         visited: Set[BlockId] = set()
         order: List[BlockId] = []
 
@@ -188,7 +188,7 @@ class SimpleCFG:
 
     @property
     def postorder(self) -> List[BlockId]:
-        """Post-order traversal (good for backward analyses)."""
+        """Post-order traversal (good for backward analysis)."""
         visited: Set[BlockId] = set()
         order: List[BlockId] = []
 
@@ -506,7 +506,7 @@ L = TypeVar("L")  # Lattice element type
 
 class DataflowAnalysis(ABC, Generic[L]):
     """
-    Abstract base for all dataflow analyses.
+    Abstract base for all dataflow analysis.
 
     Subclasses implement:
       - ``direction``      — FORWARD or BACKWARD
@@ -710,7 +710,7 @@ class DataflowAnalysis(ABC, Generic[L]):
 #  PART 3 — DEFINITION / EXPRESSION IDENTIFIERS
 # ═════════════════════════════════════════════════════════════════════════
 #
-#  Common data structures used by multiple analyses.
+#  Common data structures used by multiple analysis.
 # ═════════════════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
@@ -745,7 +745,7 @@ class Expression:
     """
     An AST expression identified by cppcheck's exprId.
 
-    For Available/Very-Busy expression analyses.
+    For Available/Very-Busy expression analysis.
     """
     expr_id: int
     text: str  # reconstructed expression text
@@ -3234,12 +3234,12 @@ class NullPointerAnalysis(DataflowAnalysis[NullEnv]):
 #  PART 19 — COMBINED ANALYSIS RUNNER
 # ═════════════════════════════════════════════════════════════════════════
 #
-#  Convenience: run multiple analyses in one call.
+#  Convenience: run multiple analysis in one call.
 # ═════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class AnalysisResults:
-    """Collected results from running multiple analyses."""
+    """Collected results from running multiple analysis."""
     reaching_defs: Optional[ReachingDefinitions] = None
     available_exprs: Optional[AvailableExpressions] = None
     very_busy_exprs: Optional[VeryBusyExpressions] = None
@@ -3256,7 +3256,7 @@ class AnalysisResults:
     null_ptrs: Optional[NullPointerAnalysis] = None
 
     @property
-    def all_analyses(self) -> List[Tuple[str, Any]]:
+    def all_analysis(self) -> List[Tuple[str, Any]]:
         result = []
         for name in (
             "reaching_defs", "available_exprs", "very_busy_exprs",
@@ -3270,20 +3270,20 @@ class AnalysisResults:
         return result
 
 
-def run_all_analyses(
+def run_all_analysis(
     configuration: Any,
     scope: Optional[Any] = None,
-    analyses: Optional[Set[str]] = None,
+    analysis: Optional[Set[str]] = None,
     taint_config: Optional[Dict[str, Callable]] = None,
 ) -> AnalysisResults:
     """
-    Run a suite of dataflow analyses on a configuration.
+    Run a suite of dataflow analysis on a configuration.
 
     Parameters
     ----------
     configuration : cppcheckdata.Configuration
     scope : optional Scope to analyse (defaults to first function)
-    analyses : optional set of analysis names to run (default: all).
+    analysis : optional set of analysis names to run (default: all).
         Valid names: "reaching_defs", "available_exprs", "very_busy_exprs",
         "live_vars", "definite_assign", "dominators", "constants",
         "copies", "pointers", "aliases", "taint", "intervals", "signs",
@@ -3293,7 +3293,7 @@ def run_all_analyses(
 
     Returns
     -------
-    AnalysisResults with populated fields for requested analyses.
+    AnalysisResults with populated fields for requested analysis.
     """
     ALL = {
         "reaching_defs", "available_exprs", "very_busy_exprs",
@@ -3301,64 +3301,64 @@ def run_all_analyses(
         "constants", "copies", "pointers", "aliases",
         "taint", "intervals", "signs", "null_ptrs",
     }
-    if analyses is None:
-        analyses = ALL
+    if analysis is None:
+        analysis = ALL
     else:
-        analyses = analyses & ALL
+        analysis = analysis & ALL
 
     results = AnalysisResults()
 
-    if "reaching_defs" in analyses:
+    if "reaching_defs" in analysis:
         rd = ReachingDefinitions(configuration, scope)
         rd.run()
         results.reaching_defs = rd
 
-    if "available_exprs" in analyses:
+    if "available_exprs" in analysis:
         ae = AvailableExpressions(configuration, scope)
         ae.run()
         results.available_exprs = ae
 
-    if "very_busy_exprs" in analyses:
+    if "very_busy_exprs" in analysis:
         vbe = VeryBusyExpressions(configuration, scope)
         vbe.run()
         results.very_busy_exprs = vbe
 
-    if "live_vars" in analyses:
+    if "live_vars" in analysis:
         lv = LiveVariables(configuration, scope)
         lv.run()
         results.live_vars = lv
 
-    if "definite_assign" in analyses:
+    if "definite_assign" in analysis:
         da = DefiniteAssignment(configuration, scope)
         da.run()
         results.definite_assign = da
 
-    if "dominators" in analyses:
+    if "dominators" in analysis:
         dom = DominatorAnalysis(configuration, scope)
         dom.run()
         results.dominators = dom
 
-    if "constants" in analyses:
+    if "constants" in analysis:
         cp = ConstantPropagation(configuration, scope)
         cp.run()
         results.constants = cp
 
-    if "copies" in analyses:
+    if "copies" in analysis:
         copy = CopyPropagation(configuration, scope)
         copy.run()
         results.copies = copy
 
-    if "pointers" in analyses:
+    if "pointers" in analysis:
         pa = PointerAnalysis(configuration, scope)
         pa.run()
         results.pointers = pa
 
-    if "aliases" in analyses:
+    if "aliases" in analysis:
         aa = AliasAnalysis(configuration, scope)
         aa.run()
         results.aliases = aa
 
-    if "taint" in analyses:
+    if "taint" in analysis:
         tc = taint_config or {}
         ta = TaintAnalysis(
             configuration, scope,
@@ -3369,17 +3369,17 @@ def run_all_analyses(
         ta.run()
         results.taint = ta
 
-    if "intervals" in analyses:
+    if "intervals" in analysis:
         ia = IntervalAnalysis(configuration, scope)
         ia.run()
         results.intervals = ia
 
-    if "signs" in analyses:
+    if "signs" in analysis:
         sa = SignAnalysis(configuration, scope)
         sa.run()
         results.signs = sa
 
-    if "null_ptrs" in analyses:
+    if "null_ptrs" in analysis:
         npa = NullPointerAnalysis(configuration, scope)
         npa.run()
         results.null_ptrs = npa
@@ -3430,5 +3430,5 @@ __all__ = [
     "NullPointerAnalysis",
     # Combined
     "AnalysisResults",
-    "run_all_analyses",
+    "run_all_analysis",
 ]

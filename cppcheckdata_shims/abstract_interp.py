@@ -3222,7 +3222,7 @@ class InterproceduralInterpreter:
     """Whole-program abstract interpreter using the callgraph.
 
     Analyses functions bottom-up, computing abstract summaries, then
-    re-analyses callers with callee summaries incorporated.
+    re-analysis callers with callee summaries incorporated.
 
     Parameters
     ----------

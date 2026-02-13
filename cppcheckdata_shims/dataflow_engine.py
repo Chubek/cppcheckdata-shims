@@ -6,7 +6,7 @@ A generic, lattice-based dataflow analysis framework operating over
 Cppcheck CFGs and call graphs.
 
 This module provides the foundational fixpoint computation engine used by
-all higher-level analyses (:mod:`abstract_interp`, :mod:`symbolic_exec`,
+all higher-level analysis (:mod:`abstract_interp`, :mod:`symbolic_exec`,
 :mod:`constraint_engine`).
 
 Theory
@@ -21,8 +21,8 @@ A dataflow analysis is defined by:
 3.  A **transfer function** ``f : Node × L → L`` — transforms the dataflow
     fact at a CFG node.
 4.  An **initial value** for the entry (forward) or exit (backward) node.
-5.  A **merge operator** — ``⊔`` (join) for may-analyses or ``⊓`` (meet)
-    for must-analyses.
+5.  A **merge operator** — ``⊔`` (join) for may-analysis or ``⊓`` (meet)
+    for must-analysis.
 
 The engine iterates until a **fixpoint** is reached: no node's dataflow
 fact changes upon re-application of its transfer function.
@@ -36,13 +36,13 @@ The engine implements several worklist strategies:
 ``LIFO``
     Simple DFS-like iteration.
 ``RPO`` (Reverse Post-Order)
-    The standard for forward analyses — processes predecessors before
+    The standard for forward analysis — processes predecessors before
     successors, converging in fewer iterations.
 ``PO`` (Post-Order)
-    The standard for backward analyses.
+    The standard for backward analysis.
 ``SCC``
     Processes strongly-connected components together, applying widening
-    at loop heads.  Best for analyses with infinite-height lattices.
+    at loop heads.  Best for analysis with infinite-height lattices.
 
 Interprocedural analysis
 ------------------------
@@ -2036,7 +2036,7 @@ class AvailableExpressionsAnalysis:
 
 
 class _InvertedPowersetLattice(Lattice[FrozenSet]):
-    """Powerset lattice with intersection as join (for must-analyses).
+    """Powerset lattice with intersection as join (for must-analysis).
 
     In this lattice:
     - ⊥ = universal set (represented as ``None`` — "all expressions")

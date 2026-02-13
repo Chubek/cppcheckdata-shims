@@ -1861,7 +1861,7 @@ class DomainReducer:
 # ===================================================================
 
 class PropertyChecker:
-    """Orchestrator that checks a ``Property`` using available analyses.
+    """Orchestrator that checks a ``Property`` using available analysis.
 
     Strategy (sequential, configurable):
     1. **Quick Filter** — use the internal solver on Cppcheck ValueFlow constraints.

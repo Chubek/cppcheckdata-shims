@@ -260,7 +260,7 @@ class AbstractValue:
 
     This is the *payload* stored at each MemoryLocation.  The memory
     model itself is agnostic to the analysis domain — AbstractValue
-    serves as the common currency between different analyses.
+    serves as the common currency between different analysis.
     """
     kind: AbstractValueKind
     concrete_int: Optional[int] = None
@@ -816,7 +816,7 @@ class MemoryState:
       - points_to:   PointsToGraph (shared, may be read-only)
 
     MemoryState is the unit passed between analysis steps.
-    It supports fork/clone for path-sensitive analyses.
+    It supports fork/clone for path-sensitive analysis.
     """
     store: AbstractStore = field(default_factory=AbstractStore)
     call_stack: List[StackFrame] = field(default_factory=list)
@@ -1525,7 +1525,7 @@ class MemoryModel:
 
     def build(self) -> "MemoryModel":
         """
-        Run all analyses: points-to, may-mod, allocation/deallocation site detection.
+        Run all analysis: points-to, may-mod, allocation/deallocation site detection.
         Returns self for chaining.
         """
         # Phase 1: Points-to graph

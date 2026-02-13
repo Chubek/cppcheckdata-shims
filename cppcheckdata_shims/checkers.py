@@ -2,10 +2,10 @@
 cppcheckdata_shims/checkers.py
 ══════════════════════════════
 
-Production checker framework that composes analyses from the
+Production checker framework that composes analysis from the
 cppcheckdata-shims infrastructure into actionable bug detectors.
 
-This is the "last mile" module: it bridges abstract analyses
+This is the "last mile" module: it bridges abstract analysis
 (dataflow, type, symbolic execution, memory abstraction) to
 concrete, CWE-tagged, cppcheck-addon-compatible diagnostics.
 
@@ -21,7 +21,7 @@ Architecture
   │         │                 │                  │          │
   │  ┌──────▼─────────────────▼──────────────────▼───────┐  │
   │  │              Evidence Collection                  │  │
-  │  │  dataflow_analyses │ type_analysis │ symbolic_exec│  │
+  │  │  dataflow_analysis │ type_analysis │ symbolic_exec│  │
   │  │  memory_abstraction│ ctrlflow_graph│ callgraph    │  │
   │  └──────────────────────────┬────────────────────────┘  │
   │                             │                           │
@@ -37,8 +37,8 @@ Architecture
 
 Each Checker follows a four-phase lifecycle:
 
-  1. **configure()**        — declare required analyses, set thresholds
-  2. **collect_evidence()** — run analyses, gather suspicious sites
+  1. **configure()**        — declare required analysis, set thresholds
+  2. **collect_evidence()** — run analysis, gather suspicious sites
   3. **diagnose()**         — correlate evidence, assign severity/confidence
   4. **report()**           — emit Diagnostics (filtered by suppressions)
 
@@ -75,7 +75,7 @@ from typing import (
 
 # ── sibling imports (best-effort) ────────────────────────────────────
 try:
-    from cppcheckdata_shims.dataflow_analyses import (  # type: ignore[import-untyped]
+    from cppcheckdata_shims.dataflow_analysis import (  # type: ignore[import-untyped]
         NullPointerAnalysis,
         IntervalAnalysis,
         LiveVariables,
@@ -85,7 +85,7 @@ try:
         SignAnalysis,
         PointerAnalysis,
         ConstantPropagation,
-        run_all_analyses,
+        run_all_analysis,
     )
 except ImportError:
     NullPointerAnalysis = None  # type: ignore[assignment,misc]
@@ -97,7 +97,7 @@ except ImportError:
     SignAnalysis = None  # type: ignore[assignment,misc]
     PointerAnalysis = None  # type: ignore[assignment,misc]
     ConstantPropagation = None  # type: ignore[assignment,misc]
-    run_all_analyses = None  # type: ignore[assignment,misc]
+    run_all_analysis = None  # type: ignore[assignment,misc]
 
 try:
     from cppcheckdata_shims.type_analysis import (  # type: ignore[import-untyped]
@@ -356,7 +356,7 @@ class Checker(ABC):
     Lifecycle
     ─────────
       1. ``configure(ctx)``        — receive context, declare needs
-      2. ``collect_evidence(ctx)``  — run or consume analyses
+      2. ``collect_evidence(ctx)``  — run or consume analysis
       3. ``diagnose(ctx)``          — correlate evidence into diagnostics
       4. ``report(ctx)``            — yield final diagnostics
 
@@ -396,9 +396,9 @@ class Checker(ABC):
     @abstractmethod
     def collect_evidence(self, ctx: CheckerContext) -> None:
         """
-        Run analyses and gather evidence.
+        Run analysis and gather evidence.
 
-        This is where you invoke dataflow_analyses, type_analysis,
+        This is where you invoke dataflow_analysis, type_analysis,
         symbolic_exec, etc. and store intermediate results.
         """
         ...
@@ -456,30 +456,30 @@ class CheckerContext:
     """
     Shared context passed to every checker during execution.
 
-    Holds the cppcheck configuration, pre-computed analyses,
+    Holds the cppcheck configuration, pre-computed analysis,
     suppression manager, and inter-checker communication.
 
     Attributes
     ----------
     cfg          : cppcheckdata.Configuration
     suppressions : SuppressionManager
-    analyses     : dict of pre-computed analysis results (keyed by name)
+    analysis     : dict of pre-computed analysis results (keyed by name)
     options      : user-provided options dict
     stats        : mutable dict for timing / counting statistics
     """
     cfg: Any  # cppcheckdata.Configuration
     suppressions: SuppressionManager = field(default_factory=SuppressionManager)
-    analyses: Dict[str, Any] = field(default_factory=dict)
+    analysis: Dict[str, Any] = field(default_factory=dict)
     options: Dict[str, Any] = field(default_factory=dict)
     stats: Dict[str, Any] = field(default_factory=dict)
 
     def get_analysis(self, name: str) -> Any:
         """Retrieve a pre-computed analysis result by name."""
-        return self.analyses.get(name)
+        return self.analysis.get(name)
 
     def set_analysis(self, name: str, result: Any) -> None:
         """Store an analysis result for sharing between checkers."""
-        self.analyses[name] = result
+        self.analysis[name] = result
 
     def get_option(self, key: str, default: Any = None) -> Any:
         return self.options.get(key, default)
