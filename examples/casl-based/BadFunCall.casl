@@ -1,0 +1,511 @@
+;; ═══════════════════════════════════════════════════════════════════════════
+;; bad_funcall.casl — Function-Call Checker in CASL
+;; ═══════════════════════════════════════════════════════════════════════════
+;;
+;; Six rules:
+;;   FC01  Call to undefined but declared function
+;;   FC02  Parameter count mismatch
+;;   FC03  Type mismatch between argument and parameter
+;;   FC04  Implicit narrowing conversion
+;;   FC05  Const-correctness violation
+;;   FC06  Incompatible calling convention or linkage
+;;
+;; CASL is a hypothetical declarative specification language for static
+;; analysis checkers.  The notation uses S-expression syntax with
+;; pattern/constraint/action triples.
+;; ═══════════════════════════════════════════════════════════════════════════
+
+
+;; ─────────────────────────────────────────────────────────────────────────
+;; 1. FACT SCHEMAS
+;; ─────────────────────────────────────────────────────────────────────────
+
+(define-fact func-decl
+  "A function declaration or definition."
+  :fields ((name           :type string)
+           (qualified-name :type string)
+           (file           :type string)
+           (line           :type int)
+           (is-defined     :type bool)
+           (is-declared    :type bool)
+           (is-variadic    :type bool)
+           (param-count    :type int)
+           (return-type    :type type-id)
+           (calling-conv   :type calling-convention)
+           (linkage        :type linkage-kind)
+           (has-noreturn   :type bool   :default false)
+           (has-attr-const :type bool   :default false)))
+
+(define-fact param-type
+  "A formal parameter of a function."
+  :fields ((func-name  :type string)     ;; owning function qualified name
+           (index      :type int)         ;; 0-based
+           (param-name :type string)
+           (base-type  :type type-id)
+           (pointer    :type int   :default 0)
+           (is-const   :type bool  :default false)
+           (is-ref     :type bool  :default false)
+           (is-signed  :type bool  :default true)
+           (orig-type  :type string)))
+
+(define-fact call-site
+  "An observed call expression."
+  :fields ((callee-name      :type string)
+           (callee-qualified  :type string)
+           (file              :type string)
+           (line              :type int)
+           (arg-count         :type int)
+           (is-fptr           :type bool  :default false)
+           (caller-linkage    :type linkage-kind :default unknown)))
+
+(define-fact arg-info
+  "An actual argument at a call site."
+  :fields ((callee-qualified :type string)
+           (call-line        :type int)
+           (index            :type int)
+           (base-type        :type type-id)
+           (pointer          :type int   :default 0)
+           (is-const         :type bool  :default false)
+           (is-ref           :type bool  :default false)
+           (is-signed        :type bool  :default true)
+           (orig-type        :type string)))
+
+
+;; ─────────────────────────────────────────────────────────────────────────
+;; 2. TYPE SYSTEM – type-id enumeration & compatibility tables
+;; ─────────────────────────────────────────────────────────────────────────
+
+(define-enum type-id
+  void bool char short wchar_t int long long-long
+  float double long-double
+  record pointer function-ptr unknown)
+
+(define-enum calling-convention
+  cdecl stdcall fastcall thiscall vectorcall unknown)
+
+(define-enum linkage-kind
+  C CXX unknown)
+
+;; Arithmetic width table (bits)
+(define-table type-width
+  ((bool        1)
+   (char        8)
+   (short      16)
+   (wchar_t    32)
+   (int        32)
+   (long       64)
+   (long-long  64)
+   (float      32)
+   (double     64)
+   (long-double 80)))
+
+;; Sets
+(define-set integral-types
+  #{bool char short wchar_t int long long-long})
+
+(define-set float-types
+  #{float double long-double})
+
+(define-set arithmetic-types
+  (union integral-types float-types))
+
+;; Narrowing predicate
+(define-predicate (narrowing? src dst)
+  "True when src → dst loses precision."
+  (or
+    ;; float → integral is always narrowing
+    (and (member? src float-types)
+         (member? dst integral-types))
+    ;; wider → narrower
+    (> (type-width src) (type-width dst))))
+
+
+;; ─────────────────────────────────────────────────────────────────────────
+;; 3. FUNCTION-SIGNATURE TABLE  (type compatibility)
+;; ─────────────────────────────────────────────────────────────────────────
+
+(define-predicate (types-compatible? param-type param-ptr param-const
+                                     arg-type   arg-ptr   arg-const)
+  "Full compatibility check between a formal parameter and an actual argument."
+  (cond
+    ;; Unknown types → assume compatible
+    ((or (= param-type unknown) (= arg-type unknown))
+     true)
+
+    ;; Pointer depth mismatch
+    ((!= param-ptr arg-ptr)
+     (if (and (> param-ptr 0) (= param-type void))
+         true    ;; void* accepts any pointer
+         false))
+
+    ;; Both pointers: pointed-to type must match (or one is void)
+    ((and (> param-ptr 0) (> arg-ptr 0))
+     (or (= param-type arg-type)
+         (= param-type void)
+         (= arg-type   void)))
+
+    ;; Both arithmetic: always "compatible" at the type level
+    ;; (narrowing is checked by FC04 separately)
+    ((and (member? param-type arithmetic-types)
+          (member? arg-type   arithmetic-types))
+     true)
+
+    ;; Record types: original-type names must match
+    ((or (= param-type record) (= arg-type record))
+     ;; Delegated to orig-type comparison in the rule body
+     true)
+
+    ;; Catch-all
+    (else (= param-type arg-type))))
+
+
+;; ─────────────────────────────────────────────────────────────────────────
+;; 4. KNOWN-EXTERNAL FUNCTIONS  (suppress FC01 for these)
+;; ─────────────────────────────────────────────────────────────────────────
+
+(define-set known-external-functions
+  #{"printf" "fprintf" "sprintf" "snprintf" "vprintf" "vfprintf"
+    "vsprintf" "vsnprintf" "scanf" "fscanf" "sscanf"
+    "malloc" "calloc" "realloc" "free"
+    "memcpy" "memmove" "memset" "memcmp"
+    "strlen" "strcpy" "strncpy" "strcmp" "strncmp"
+    "strcat" "strncat" "strstr" "strchr" "strrchr"
+    "abs" "labs" "llabs" "fabs"
+    "sin" "cos" "tan" "sqrt" "pow" "log" "exp"
+    "fopen" "fclose" "fread" "fwrite" "fseek" "ftell"
+    "exit" "abort" "atexit" "_exit"
+    "open" "close" "read" "write" "lseek"
+    "stat" "fstat" "lstat"
+    "getenv" "setenv" "unsetenv"
+    "pthread_create" "pthread_join"
+    "pthread_mutex_init" "pthread_mutex_lock" "pthread_mutex_unlock"
+    "__builtin_expect" "__builtin_unreachable"
+    "__builtin_popcount" "__builtin_clz" "__builtin_ctz"})
+
+
+;; ─────────────────────────────────────────────────────────────────────────
+;; 5. SUPPRESSION MECHANISM
+;; ─────────────────────────────────────────────────────────────────────────
+
+(define-predicate (suppressed? rule file line)
+  "Check if a diagnostic is suppressed by inline comment or attribute."
+  (or
+    (has-inline-suppression? file line (concat "BadFunCall-" rule))
+    (has-attribute? (callee-at file line) "suppress")))
+
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; 6. RULES  (pattern / constraint / action triples)
+;; ═══════════════════════════════════════════════════════════════════════════
+
+;; ── FC01: Call to undefined but declared function ────────────────────────
+
+(define-rule FC01
+  :doc "Flag calls to functions that are declared but have no definition."
+  :severity warning
+
+  :pattern
+    (call-site :callee-qualified ?qname
+               :file ?file :line ?line)
+
+  :constraint
+    (and
+      ;; A matching declaration exists …
+      (exists (func-decl :qualified-name ?qname
+                         :is-declared    true
+                         :is-defined     false
+                         :file           ?decl-file
+                         :line           ?decl-line))
+      ;; … and it is NOT a known external symbol
+      (not (member? (func-decl :name) known-external-functions))
+      ;; … and it is not suppressed
+      (not (suppressed? "FC01" ?file ?line)))
+
+  :action
+    (report :rule     "FC01"
+            :severity warning
+            :file     ?file
+            :line     ?line
+            :message  (format "Call to declared but undefined function '~a' "
+                              "(declared at ~a:~a)"
+                              ?qname ?decl-file ?decl-line)))
+
+
+;; ── FC02: Parameter count mismatch ──────────────────────────────────────
+
+(define-rule FC02
+  :doc "Flag calls where the number of arguments does not match the number of parameters."
+  :severity error
+
+  :pattern
+    (call-site :callee-qualified ?qname
+               :arg-count        ?nargs
+               :file ?file :line ?line)
+
+  :constraint
+    (and
+      (exists (func-decl :qualified-name ?qname
+                         :param-count    ?nparams
+                         :is-variadic    ?variadic))
+      ;; For non-variadic: exact match required
+      ;; For variadic:     at least nparams required
+      (or
+        ;; Case A: non-variadic, wrong count
+        (and (= ?variadic false)
+             (!= ?nargs ?nparams)
+             (> ?nparams 0))
+        ;; Case B: variadic, too few
+        (and (= ?variadic true)
+             (< ?nargs ?nparams)))
+      (not (suppressed? "FC02" ?file ?line)))
+
+  :action
+    (report :rule     "FC02"
+            :severity error
+            :file     ?file
+            :line     ?line
+            :message  (if (= ?variadic true)
+                        (format "Too few arguments to variadic function '~a': "
+                                "expected at least ~a, got ~a"
+                                ?qname ?nparams ?nargs)
+                        (if (< ?nargs ?nparams)
+                          (format "Too few arguments to '~a': expected ~a, got ~a"
+                                  ?qname ?nparams ?nargs)
+                          (format "Too many arguments to '~a': expected ~a, got ~a"
+                                  ?qname ?nparams ?nargs)))))
+
+
+;; ── FC03: Type mismatch between argument and parameter ──────────────────
+
+(define-rule FC03
+  :doc "Flag arguments whose type is incompatible with the corresponding parameter."
+  :severity error
+
+  :pattern
+    (and
+      (call-site :callee-qualified ?qname
+                 :file ?file :line ?line)
+      (arg-info  :callee-qualified ?qname
+                 :call-line        ?line
+                 :index            ?idx
+                 :base-type        ?atype
+                 :pointer          ?aptr
+                 :is-const         ?aconst
+                 :orig-type        ?aorig)
+      (param-type :func-name ?qname
+                  :index     ?idx
+                  :base-type ?ptype
+                  :pointer   ?pptr
+                  :is-const  ?pconst
+                  :orig-type ?porig))
+
+  :constraint
+    (and
+      ;; Types are NOT compatible
+      (not (types-compatible? ?ptype ?pptr ?pconst
+                              ?atype ?aptr ?aconst))
+      ;; For record types, also check original-type names
+      (or (not (or (= ?ptype record) (= ?atype record)))
+          (!= ?porig ?aorig))
+      (not (suppressed? "FC03" ?file ?line)))
+
+  :action
+    (report :rule     "FC03"
+            :severity error
+            :file     ?file
+            :line     ?line
+            :message  (format "In call to '~a', argument ~a: type mismatch — "
+                              "expected '~a' (ptr=~a), got '~a' (ptr=~a)"
+                              ?qname (+ ?idx 1)
+                              ?ptype ?pptr ?atype ?aptr)))
+
+
+;; ── FC04: Implicit narrowing conversion ─────────────────────────────────
+
+(define-rule FC04-narrowing
+  :doc "Flag arguments that undergo narrowing conversion to match the parameter type."
+  :severity warning
+
+  :pattern
+    (and
+      (call-site :callee-qualified ?qname
+                 :file ?file :line ?line)
+      (arg-info  :callee-qualified ?qname
+                 :call-line        ?line
+                 :index            ?idx
+                 :base-type        ?atype
+                 :is-signed        ?asign)
+      (param-type :func-name ?qname
+                  :index     ?idx
+                  :param-name ?pname
+                  :base-type ?ptype
+                  :is-signed ?psign))
+
+  :constraint
+    (and
+      (member? ?atype arithmetic-types)
+      (member? ?ptype arithmetic-types)
+      (or
+        ;; Width-based narrowing
+        (narrowing? ?atype ?ptype)
+        ;; Signed/unsigned mismatch of identical base type
+        (and (= ?atype ?ptype)
+             (!= ?asign ?psign)))
+      (not (suppressed? "FC04" ?file ?line)))
+
+  :action
+    (report :rule     "FC04"
+            :severity warning
+            :file     ?file
+            :line     ?line
+            :message  (if (narrowing? ?atype ?ptype)
+                        (format "Implicit narrowing in call to '~a': "
+                                "argument ~a (~a) converts '~a' → '~a'"
+                                ?qname (+ ?idx 1) ?pname ?atype ?ptype)
+                        (format "Signed/unsigned mismatch in call to '~a': "
+                                "argument ~a (~a) — param is ~a, arg is ~a"
+                                ?qname (+ ?idx 1) ?pname
+                                (if ?psign "signed" "unsigned")
+                                (if ?asign "signed" "unsigned")))))
+
+;; FC04 for variadic extra arguments (default argument promotions)
+(define-rule FC04-variadic-promotion
+  :doc "Warn about default argument promotions in variadic calls."
+  :severity warning
+
+  :pattern
+    (and
+      (call-site :callee-qualified ?qname
+                 :arg-count        ?nargs
+                 :file ?file :line ?line)
+      (func-decl :qualified-name ?qname
+                 :is-variadic    true
+                 :param-count    ?nparams)
+      (arg-info  :callee-qualified ?qname
+                 :call-line        ?line
+                 :index            ?idx
+                 :base-type        ?atype))
+
+  :constraint
+    (and
+      (>= ?idx ?nparams)   ;; only extra (variadic) arguments
+      (or (= ?atype float)
+          (member? ?atype #{char short bool}))
+      (not (suppressed? "FC04" ?file ?line)))
+
+  :action
+    (report :rule     "FC04"
+            :severity warning
+            :file     ?file
+            :line     ?line
+            :message  (if (= ?atype float)
+                        (format "In variadic call to '~a', argument ~a "
+                                "of type 'float' will be promoted to 'double'"
+                                ?qname (+ ?idx 1))
+                        (format "In variadic call to '~a', argument ~a "
+                                "of type '~a' will be promoted to 'int'"
+                                ?qname (+ ?idx 1) ?atype))))
+
+
+;; ── FC05: Const-correctness violation ───────────────────────────────────
+
+(define-rule FC05
+  :doc "Flag passing a const-qualified object to a non-const pointer/ref parameter."
+  :severity warning
+
+  :pattern
+    (and
+      (call-site :callee-qualified ?qname
+                 :file ?file :line ?line)
+      (arg-info  :callee-qualified ?qname
+                 :call-line        ?line
+                 :index            ?idx
+                 :is-const         true       ;; argument IS const
+                 :pointer          ?aptr
+                 :is-ref           ?aref)
+      (param-type :func-name ?qname
+                  :index     ?idx
+                  :param-name ?pname
+                  :is-const  false             ;; parameter is NOT const
+                  :pointer   ?pptr
+                  :is-ref    ?pref))
+
+  :constraint
+    (and
+      ;; Only relevant for pointer or reference parameters
+      (or (> ?pptr 0) (= ?pref true))
+      (not (suppressed? "FC05" ?file ?line)))
+
+  :action
+    (report :rule     "FC05"
+            :severity warning
+            :file     ?file
+            :line     ?line
+            :message  (format "Const-correctness violation in call to '~a': "
+                              "argument ~a (~a) passes a const-qualified "
+                              "object to a non-const parameter"
+                              ?qname (+ ?idx 1) ?pname)))
+
+
+;; ── FC06: Incompatible calling convention or linkage ────────────────────
+
+(define-rule FC06-linkage
+  :doc "Flag calls where caller and callee have mismatched linkage."
+  :severity portability
+
+  :pattern
+    (call-site :callee-qualified ?qname
+               :caller-linkage   ?caller-link
+               :file ?file :line ?line)
+
+  :constraint
+    (and
+      (exists (func-decl :qualified-name ?qname
+                         :linkage        ?callee-link))
+      (!= ?caller-link unknown)
+      (!= ?callee-link unknown)
+      (!= ?caller-link ?callee-link)
+      (not (suppressed? "FC06" ?file ?line)))
+
+  :action
+    (report :rule     "FC06"
+            :severity portability
+            :file     ?file
+            :line     ?line
+            :message  (format "Linkage mismatch: call to '~a' has ~a linkage, "
+                              "but call site is in a ~a context"
+                              ?qname ?callee-link ?caller-link)))
+
+(define-rule FC06-calling-conv
+  :doc "Flag functions with conflicting calling-convention declarations."
+  :severity portability
+
+  :pattern
+    (call-site :callee-qualified ?qname
+               :file ?file :line ?line)
+
+  :constraint
+    (and
+      ;; Find two declarations of the same function with different conventions
+      (exists (func-decl :qualified-name ?qname
+                         :calling-conv   ?cc1))
+      (exists (func-decl :qualified-name ?qname
+                         :calling-conv   ?cc2))
+      (!= ?cc1 unknown)
+      (!= ?cc2 unknown)
+      (!= ?cc1 ?cc2)
+      (not (suppressed? "FC06" ?file ?line)))
+
+  :action
+    (report :rule     "FC06"
+            :severity portability
+            :file     ?file
+            :line     ?line
+            :message  (format "Conflicting calling conventions for '~a': "
+                              "~a vs ~a"
+                              ?qname ?cc1 ?cc2)))
+
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; 7. END
+;; ═══════════════════════════════════════════════════════════════════════════
