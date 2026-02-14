@@ -1,0 +1,552 @@
+;;;; ═══════════════════════════════════════════════════════════════════
+;;;; redundant_computation.casl
+;;;;
+;;;; Declarative specification for detecting redundant computations
+;;;; in C/C++ programs. Compiles to a Cppcheck Python addon via
+;;;; the CASL compiler.
+;;;;
+;;;; Rules:
+;;;;   RC01 — Fully redundant subexpression
+;;;;   RC02 — Redundant conditional test (dominated identical guard)
+;;;;   RC03 — Redundant assignment (same LHS = same RHS, unchanged)
+;;;;   RC04 — Loop-invariant computation
+;;;;   RC05 — Redundant pure function call
+;;;;   RC06 — Dead store followed by identical recomputation
+;;;; ═══════════════════════════════════════════════════════════════════
+
+(spec redundant-computation
+  :version "1.0.0"
+  :language (C C++)
+  :description "Detect redundant computations: repeated expressions,
+                dominated conditions, loop-invariant code, and dead stores."
+  :authors ("CASL Static Analysis Team")
+  :references (
+    "Kildall 1973 — A Unified Approach to Global Program Optimization"
+    "Morel & Renvoise 1979 — Global Optimization by Suppression of Partial Redundancies"
+    "Knoop, Rüthing, Steffen 1992 — Lazy Code Motion"
+  ))
+
+
+;;; ─────────────────────────────────────────────────────────────────────
+;;; Fact Schemas
+;;;
+;;; Facts are the inter-rule communication mechanism. Each fact has a
+;;; name, a set of typed fields, and an optional persistence scope.
+;;; ─────────────────────────────────────────────────────────────────────
+
+(fact-schema expr-computed
+  "Records that a canonical expression was computed at a program point."
+  :fields (
+    (expr-canonical :type string   :doc "Normalised expression fingerprint")
+    (location       :type location :doc "File, line, column of computation")
+    (scope-id       :type int      :doc "Enclosing function scope ID")
+    (operand-vars   :type (set int) :doc "Variable IDs in the expression")
+    (is-pure-call   :type bool     :doc "Whether this is a known pure function call")
+    (callee-name    :type string   :doc "Name of callee if pure call, else empty")
+  )
+  :persist per-function)
+
+(fact-schema var-assigned
+  "Records an assignment to a variable."
+  :fields (
+    (var-id         :type int      :doc "Assigned variable's ID")
+    (var-name       :type string   :doc "Variable name")
+    (rhs-canonical  :type string   :doc "Normalised RHS fingerprint")
+    (rhs-vars       :type (set int) :doc "Variables in the RHS expression")
+    (location       :type location :doc "Assignment location")
+    (scope-id       :type int      :doc "Enclosing scope")
+  )
+  :persist per-function)
+
+(fact-schema condition-tested
+  "Records a branch condition."
+  :fields (
+    (cond-canonical :type string   :doc "Normalised condition fingerprint")
+    (operand-vars   :type (set int) :doc "Variables in the condition")
+    (location       :type location :doc "Condition location")
+    (scope-id       :type int      :doc "Enclosing scope")
+    (is-loop-cond   :type bool     :doc "Whether inside while/for header")
+  )
+  :persist per-function)
+
+(fact-schema available-expr
+  "Data-flow result: expression is available at this program point."
+  :fields (
+    (expr-canonical :type string)
+    (block-id       :type int)
+    (scope-id       :type int)
+  )
+  :persist per-function)
+
+(fact-schema loop-invariant-var
+  "A variable that is not modified inside a given natural loop."
+  :fields (
+    (var-id   :type int)
+    (loop-id  :type int)
+  )
+  :persist per-function)
+
+
+;;; ─────────────────────────────────────────────────────────────────────
+;;; Pure-Function Database
+;;; ─────────────────────────────────────────────────────────────────────
+
+(declare-pure-functions
+  strlen strcmp strncmp memcmp
+  abs fabs labs llabs
+  sqrt cbrt pow exp log log2 log10
+  sin cos tan asin acos atan atan2
+  ceil floor round trunc
+  isdigit isalpha isalnum isspace isupper islower
+  toupper tolower
+  min max sizeof offsetof
+  htons htonl ntohs ntohl)
+
+
+;;; ─────────────────────────────────────────────────────────────────────
+;;; Expression Normalisation
+;;;
+;;; Commutative operators have their operands sorted lexicographically
+;;; by canonical form, ensuring a + b == b + a.
+;;; ─────────────────────────────────────────────────────────────────────
+
+(define-normaliser canonical-expr
+  :doc "Produce a canonical string for an expression AST node."
+  :rules (
+    ;; Variable → "var:<id>"
+    ((variable ?v) → (format "var:~a" (var-id ?v)))
+
+    ;; Literal → "lit:<text>"
+    ((literal ?l)  → (format "lit:~a" (token-str ?l)))
+
+    ;; Commutative binary: sort operands
+    ((binop ?op ?lhs ?rhs)
+     :when (member ?op (+ * & | ^ == != && ||))
+     → (let ((l (canonical-expr ?lhs))
+             (r (canonical-expr ?rhs)))
+         (if (string< l r)
+             (format "(~a ~a ~a)" l ?op r)
+             (format "(~a ~a ~a)" r ?op l))))
+
+    ;; Non-commutative binary
+    ((binop ?op ?lhs ?rhs)
+     → (format "(~a ~a ~a)" (canonical-expr ?lhs) ?op (canonical-expr ?rhs)))
+
+    ;; Function call
+    ((call ?name ?args)
+     → (format "call:~a(~a)" ?name (join "," (map canonical-expr ?args))))
+
+    ;; Unary
+    ((unop ?op ?operand)
+     → (format "(u~a ~a)" ?op (canonical-expr ?operand)))
+  ))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE RC01 — Fully Redundant Subexpression
+;;;
+;;; An expression is redundant if it has already been computed on
+;;; EVERY path reaching this point and no operand was modified.
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule RC01-collect-expressions
+  :doc "Phase 1: Record every non-trivial expression computation."
+  :phase collect
+
+  :pattern
+    (ast-match
+      (binop ?op ?lhs ?rhs)
+      :where (and
+        (member ?op (+ - * / % == != < <= > >= && || & | ^ << >>))
+        (has-variable-operand ?lhs ?rhs)))
+
+  :action
+    (set-fact expr-computed
+      :expr-canonical (canonical-expr (current-ast))
+      :location       (current-location)
+      :scope-id       (current-scope-id)
+      :operand-vars   (collect-var-ids (current-ast))
+      :is-pure-call   #f
+      :callee-name    ""))
+
+
+(rule RC01-available-expressions
+  :doc "Phase 2: Run available-expressions data-flow analysis."
+  :phase dataflow
+  :requires (RC01-collect-expressions)
+
+  :analysis
+    (available-expressions
+      :domain   (powerset-of expr-computed :key expr-canonical)
+      :direction forward
+      :meet     intersection
+      :init-entry empty-set
+      :init-other universal-set
+
+      :gen  (lambda (block)
+              (set-of e
+                :for-each (e <- (facts-in-block expr-computed block))
+                :where (not (any-operand-killed-after e block))))
+
+      :kill (lambda (block)
+              (set-of e
+                :for-each (e <- (all-facts expr-computed))
+                :where (any-var-in (operand-vars e)
+                                   (vars-defined-in block)))))
+
+  :action
+    (for-each-result (block avail-in)
+      (for-each (e <- (facts-in-block expr-computed block))
+        (when (member (expr-canonical e) avail-in)
+          (set-fact available-expr
+            :expr-canonical (expr-canonical e)
+            :block-id       (block-id block)
+            :scope-id       (scope-id e))))))
+
+
+(rule RC01-report
+  :doc "Phase 3: Report expressions that are computed where already available."
+  :phase report
+  :requires (RC01-available-expressions)
+
+  :pattern
+    (and
+      (fact-match expr-computed ?e)
+      (fact-match available-expr ?a
+        :where (= (expr-canonical ?a) (expr-canonical ?e))
+        :where (= (scope-id ?a)       (scope-id ?e))
+        :where (= (block-id ?a)       (block-id-of ?e)))
+      ;; Find the FIRST computation for the note
+      (fact-match expr-computed ?first
+        :where (= (expr-canonical ?first) (expr-canonical ?e))
+        :where (= (scope-id ?first)       (scope-id ?e))
+        :where (location< (location ?first) (location ?e))
+        :minimize (location ?first)))
+
+  :constraint
+    (not (= (location ?first) (location ?e)))
+
+  :action
+    (report
+      :id       "redundantComputation.RC01"
+      :severity performance
+      :location (location ?e)
+      :message  (format
+        "redundant computation of '~a' — value already available from line ~a"
+        (reconstruct-text ?e)
+        (line-of (location ?first)))
+      :note     (format "expression first computed here"
+                 :at (location ?first))))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE RC02 — Redundant Conditional Test
+;;;
+;;; A condition is redundant if an identical condition DOMINATES it
+;;; and no operand was modified between the two tests.
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule RC02-collect-conditions
+  :doc "Record branch conditions for dominance analysis."
+  :phase collect
+
+  :pattern
+    (or
+      (stmt-match (if    ?cond ?then ?else))
+      (stmt-match (while ?cond ?body))
+      (stmt-match (for   ?init ?cond ?step ?body)))
+
+  :constraint
+    (has-variable-operand ?cond)
+
+  :action
+    (set-fact condition-tested
+      :cond-canonical (canonical-expr ?cond)
+      :operand-vars   (collect-var-ids ?cond)
+      :location       (location-of ?cond)
+      :scope-id       (current-scope-id)
+      :is-loop-cond   (or (match? (while _ _) (parent-stmt))
+                          (match? (for _ _ _ _) (parent-stmt)))))
+
+
+(rule RC02-report
+  :doc "Report conditions dominated by an identical earlier test."
+  :phase report
+  :requires (RC02-collect-conditions)
+
+  :pattern
+    (and
+      (fact-match condition-tested ?c1)
+      (fact-match condition-tested ?c2
+        :where (= (cond-canonical ?c1) (cond-canonical ?c2))
+        :where (= (scope-id ?c1)       (scope-id ?c2))
+        :where (location< (location ?c1) (location ?c2))))
+
+  :constraint
+    (and
+      ;; c1's block dominates c2's block
+      (dominates (block-of ?c1) (block-of ?c2))
+      ;; No operand killed on the dominator path
+      (not (any-var-modified-on-dompath
+             (operand-vars ?c1)
+             (block-of ?c1)
+             (block-of ?c2))))
+
+  :action
+    (report
+      :id       "redundantComputation.RC02"
+      :severity warning
+      :location (location ?c2)
+      :message  (format
+        "redundant condition '~a' — already tested at line ~a which dominates this point"
+        (reconstruct-text ?c2)
+        (line-of (location ?c1)))
+      :note     (format "condition first tested here"
+                 :at (location ?c1))))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE RC03 — Redundant Assignment
+;;;
+;;; x = E; ... x = E; where E is unchanged and x was used between.
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule RC03-collect-assignments
+  :doc "Record all assignments for redundancy analysis."
+  :phase collect
+
+  :pattern
+    (ast-match (assign ?lhs ?rhs)
+      :where (is-variable ?lhs))
+
+  :action
+    (set-fact var-assigned
+      :var-id        (var-id ?lhs)
+      :var-name      (token-str ?lhs)
+      :rhs-canonical (canonical-expr ?rhs)
+      :rhs-vars      (collect-var-ids ?rhs)
+      :location      (current-location)
+      :scope-id      (current-scope-id)))
+
+
+(rule RC03-report
+  :doc "Report redundant assignments where value and RHS are identical."
+  :phase report
+  :requires (RC03-collect-assignments)
+
+  :pattern
+    (and
+      (fact-match var-assigned ?a1)
+      (fact-match var-assigned ?a2
+        :where (= (var-id ?a1)        (var-id ?a2))
+        :where (= (rhs-canonical ?a1) (rhs-canonical ?a2))
+        :where (= (scope-id ?a1)      (scope-id ?a2))
+        :where (location< (location ?a1) (location ?a2))))
+
+  :constraint
+    (and
+      ;; No modification of LHS or any RHS operand between a1 and a2
+      (not (any-var-modified-between
+             (union (singleton (var-id ?a1)) (rhs-vars ?a1))
+             (location ?a1)
+             (location ?a2)))
+      ;; The variable IS used between (otherwise it's RC06)
+      (var-used-between (var-id ?a1) (location ?a1) (location ?a2)))
+
+  :action
+    (report
+      :id       "redundantComputation.RC03"
+      :severity style
+      :location (location ?a2)
+      :message  (format
+        "redundant assignment: '~a = ~a' — identical assignment at line ~a with no intervening modification"
+        (var-name ?a2)
+        (reconstruct-text-rhs ?a2)
+        (line-of (location ?a1)))
+      :note     (format "first assigned here" :at (location ?a1))))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE RC04 — Loop-Invariant Computation
+;;;
+;;; An expression inside a loop whose operands are all loop-invariant
+;;; (not modified within the loop body).
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule RC04-identify-invariant-vars
+  :doc "Mark variables not modified inside each natural loop."
+  :phase dataflow
+  :requires (RC03-collect-assignments)
+
+  :analysis
+    (for-each-natural-loop (loop)
+      (let ((modified-vars (set-of (var-id a)
+                            :for-each (a <- (assignments-in-loop loop)))))
+        (for-each-var-in-scope (v (scope-of loop))
+          (when (not (member (var-id v) modified-vars))
+            (set-fact loop-invariant-var
+              :var-id  (var-id v)
+              :loop-id (loop-id loop)))))))
+
+
+(rule RC04-report
+  :doc "Report expressions in loops where all operands are invariant."
+  :phase report
+  :requires (RC04-identify-invariant-vars RC01-collect-expressions)
+
+  :pattern
+    (and
+      (fact-match expr-computed ?e
+        :where (in-loop ?e))
+      (for-all (v <- (operand-vars ?e))
+        (fact-match loop-invariant-var ?inv
+          :where (= (var-id ?inv) v)
+          :where (= (loop-id ?inv) (enclosing-loop-id ?e)))))
+
+  :constraint
+    ;; At least one variable operand (pure constants are trivial)
+    (not (empty? (operand-vars ?e)))
+
+  :action
+    (report
+      :id       "redundantComputation.RC04"
+      :severity performance
+      :location (location ?e)
+      :message  (format
+        "loop-invariant computation: '~a' — all operands are unchanged within the loop; consider hoisting"
+        (reconstruct-text ?e))))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE RC05 — Redundant Pure Function Call
+;;;
+;;; Like RC01 but specifically for calls to known-pure functions.
+;;; Gets its own rule ID for selective enabling/disabling.
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule RC05-collect-pure-calls
+  :doc "Record calls to known-pure functions."
+  :phase collect
+
+  :pattern
+    (ast-match (call ?callee ?args)
+      :where (is-pure-function ?callee))
+
+  :action
+    (set-fact expr-computed
+      :expr-canonical (canonical-expr (current-ast))
+      :location       (current-location)
+      :scope-id       (current-scope-id)
+      :operand-vars   (collect-var-ids ?args)
+      :is-pure-call   #t
+      :callee-name    (token-str ?callee)))
+
+
+(rule RC05-report
+  :doc "Report redundant pure function calls via available-expressions."
+  :phase report
+  :requires (RC01-available-expressions RC05-collect-pure-calls)
+
+  :pattern
+    (and
+      (fact-match expr-computed ?e :where (is-pure-call ?e))
+      (fact-match available-expr ?a
+        :where (= (expr-canonical ?a) (expr-canonical ?e))
+        :where (= (scope-id ?a)       (scope-id ?e)))
+      (fact-match expr-computed ?first
+        :where (= (expr-canonical ?first) (expr-canonical ?e))
+        :where (= (scope-id ?first)       (scope-id ?e))
+        :where (location< (location ?first) (location ?e))
+        :minimize (location ?first)))
+
+  :constraint
+    (not (= (location ?first) (location ?e)))
+
+  :action
+    (report
+      :id       "redundantComputation.RC05"
+      :severity performance
+      :location (location ?e)
+      :message  (format
+        "redundant call to pure function '~a' — result already available from line ~a"
+        (callee-name ?e)
+        (line-of (location ?first)))
+      :note     (format "call first made here" :at (location ?first))))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE RC06 — Dead Store + Identical Recomputation
+;;;
+;;; x = E; ... x = E; where E unchanged but x is NEVER USED between.
+;;; The first assignment is wasted (dead store).
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule RC06-report
+  :doc "Report dead stores where the value is reassigned identically without use."
+  :phase report
+  :requires (RC03-collect-assignments)
+
+  :pattern
+    (and
+      (fact-match var-assigned ?a1)
+      (fact-match var-assigned ?a2
+        :where (= (var-id ?a1)        (var-id ?a2))
+        :where (= (rhs-canonical ?a1) (rhs-canonical ?a2))
+        :where (= (scope-id ?a1)      (scope-id ?a2))
+        :where (location< (location ?a1) (location ?a2))))
+
+  :constraint
+    (and
+      ;; No modification of LHS or RHS operands between a1 and a2
+      (not (any-var-modified-between
+             (union (singleton (var-id ?a1)) (rhs-vars ?a1))
+             (location ?a1)
+             (location ?a2)))
+      ;; The variable is NOT used between (this distinguishes RC06 from RC03)
+      (not (var-used-between (var-id ?a1) (location ?a1) (location ?a2))))
+
+  :action
+    (report
+      :id       "redundantComputation.RC06"
+      :severity warning
+      :location (location ?a1)
+      :message  (format
+        "dead store: '~a = ~a' at line ~a is never used before being reassigned at line ~a"
+        (var-name ?a1)
+        (reconstruct-text-rhs ?a1)
+        (line-of (location ?a1))
+        (line-of (location ?a2)))
+      :note     (format "reassigned here" :at (location ?a2))))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; Suppression Directives
+;;; ═══════════════════════════════════════════════════════════════════
+
+(suppress-on-comment
+  :pattern "// NOLINTNEXTLINE(redundant-computation)"
+  :scope   next-line
+  :rules   (RC01 RC02 RC03 RC04 RC05 RC06))
+
+(suppress-on-comment
+  :pattern "// NOLINT(redundant-computation)"
+  :scope   same-line
+  :rules   (RC01 RC02 RC03 RC04 RC05 RC06))
+
+(suppress-on-attribute
+  :pattern "__attribute__((annotate(\"casl:suppress:RC*\")))"
+  :scope   function
+  :rules   (RC01 RC02 RC03 RC04 RC05 RC06))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; Configuration
+;;; ═══════════════════════════════════════════════════════════════════
+
+(config
+  :max-function-tokens 50000      ;; skip enormous generated functions
+  :max-dataflow-iterations 1000   ;; bound fixed-point iteration
+  :worklist-strategy reverse-postorder
+  :commutative-normalisation #t
+  :user-pure-functions-file "pure_functions.txt"  ;; optional user extension
+  )
