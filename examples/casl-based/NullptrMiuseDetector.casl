@@ -1,0 +1,830 @@
+;;;; ═══════════════════════════════════════════════════════════════════
+;;;; nullptr_misuse_detector.casl
+;;;;
+;;;; Declarative specification for detecting erroneous usage of
+;;;; nullptr / NULL in C and C++ programs.
+;;;;
+;;;; Rules:
+;;;;   NP01 — Definite null dereference
+;;;;   NP02 — Dereference before null check
+;;;;   NP03 — Null-returning function result used without check
+;;;;   NP04 — Redundant null check (pointer provably non-null)
+;;;;   NP05 — Null passed to non-null parameter
+;;;;   NP06 — Arithmetic on null pointer
+;;;;   NP07 — Null assigned then dereferenced (no intervening reassignment)
+;;;;   NP08 — Tautological double null check
+;;;; ═══════════════════════════════════════════════════════════════════
+
+(spec nullptr-misuse-detector
+  :version "1.0.0"
+  :language (C C++)
+  :description "Detect null-pointer dereferences, missing null checks,
+                redundant checks, and related null-pointer misuse."
+  :authors ("CASL Static Analysis Team")
+  :references (
+    "CWE-476: NULL Pointer Dereference"
+    "CWE-690: Unchecked Return Value to NULL Pointer Dereference"
+    "CERT C: EXP34-C, MEM35-C"
+    "MISRA C:2012 Rule 11.9"
+  ))
+
+
+;;; ─────────────────────────────────────────────────────────────────────
+;;; Null Literal Recognition
+;;; ─────────────────────────────────────────────────────────────────────
+
+(declare-null-literals
+  nullptr NULL 0 0L 0LL 0U 0UL 0ULL 0x0 0X0)
+
+
+;;; ─────────────────────────────────────────────────────────────────────
+;;; Functions That May Return NULL
+;;; ─────────────────────────────────────────────────────────────────────
+
+(declare-may-return-null-functions
+  ;; Allocation
+  (malloc        :reason "memory allocation")
+  (calloc        :reason "memory allocation")
+  (realloc       :reason "memory reallocation")
+  (aligned_alloc :reason "memory allocation")
+  (strdup        :reason "string duplication")
+  (strndup       :reason "string duplication")
+  ;; I/O
+  (fopen   :reason "file open")
+  (freopen :reason "file reopen")
+  (fdopen  :reason "file open")
+  (tmpfile :reason "temp file creation")
+  (popen   :reason "process open")
+  ;; String search
+  (strchr  :reason "character search")
+  (strrchr :reason "character search")
+  (strstr  :reason "substring search")
+  (strpbrk :reason "character span search")
+  (strtok  :reason "string tokenisation")
+  (bsearch :reason "binary search")
+  ;; Environment
+  (getenv    :reason "environment lookup")
+  (setlocale :reason "locale setting")
+  (tmpnam    :reason "temp name generation")
+  ;; Dynamic loading
+  (dlopen :reason "dynamic library loading")
+  (dlsym  :reason "symbol lookup")
+  ;; Memory mapping
+  (mmap :reason "memory mapping"))
+
+
+;;; ─────────────────────────────────────────────────────────────────────
+;;; Functions Requiring Non-null Parameters
+;;;
+;;; Format: (function-name :non-null-params (index ...))
+;;; Indices are 0-based.
+;;; ─────────────────────────────────────────────────────────────────────
+
+(declare-non-null-params
+  (memcpy   :non-null-params (0 1))
+  (memmove  :non-null-params (0 1))
+  (memset   :non-null-params (0))
+  (memcmp   :non-null-params (0 1))
+  (strcpy   :non-null-params (0 1))
+  (strncpy  :non-null-params (0 1))
+  (strcat   :non-null-params (0 1))
+  (strncat  :non-null-params (0 1))
+  (strcmp    :non-null-params (0 1))
+  (strncmp  :non-null-params (0 1))
+  (strlen   :non-null-params (0))
+  (printf   :non-null-params (0))
+  (fprintf  :non-null-params (0 1))
+  (sprintf  :non-null-params (0 1))
+  (snprintf :non-null-params (0 2))
+  (fputs    :non-null-params (0 1))
+  (puts     :non-null-params (0))
+  (fwrite   :non-null-params (0 3))
+  (fread    :non-null-params (0 3))
+  (fclose   :non-null-params (0))
+  (fflush   :non-null-params (0))
+  (qsort    :non-null-params (0 3)))
+
+
+;;; ─────────────────────────────────────────────────────────────────────
+;;; Fact Schemas
+;;; ─────────────────────────────────────────────────────────────────────
+
+(fact-schema deref-site
+  "A dereference of a pointer via *, ->, or []."
+  :fields (
+    (var-id     :type int)
+    (var-name   :type string)
+    (location   :type location)
+    (scope-id   :type int)
+    (deref-kind :type symbol     :doc "star | arrow | subscript")
+  )
+  :persist per-function)
+
+(fact-schema null-check
+  "A comparison of a pointer against null."
+  :fields (
+    (var-id      :type int)
+    (var-name    :type string)
+    (location    :type location)
+    (scope-id    :type int)
+    (is-eq-null  :type bool  :doc "True for (p == NULL) or (!p)")
+    (is-negation :type bool  :doc "True for (!p) form")
+  )
+  :persist per-function)
+
+(fact-schema null-assignment
+  "An assignment of a null value to a pointer."
+  :fields (
+    (var-id   :type int)
+    (var-name :type string)
+    (location :type location)
+    (scope-id :type int)
+  )
+  :persist per-function)
+
+(fact-schema null-return-call
+  "A call to a function that may return null."
+  :fields (
+    (func-name     :type string)
+    (return-reason  :type string)
+    (assigned-var-id   :type (option int))
+    (assigned-var-name :type string)
+    (location      :type location)
+    (scope-id      :type int)
+  )
+  :persist per-function)
+
+(fact-schema non-null-arg-pass
+  "Passing a null value to a non-null parameter."
+  :fields (
+    (func-name   :type string)
+    (param-index :type int)
+    (arg-var-name :type string)
+    (arg-var-id  :type (option int))
+    (location    :type location)
+    (scope-id    :type int)
+  )
+  :persist per-function)
+
+
+;;; ─────────────────────────────────────────────────────────────────────
+;;; Null-State Abstract Domain
+;;;
+;;;            Top (unknown)
+;;;             |
+;;;          MaybeNull
+;;;          /       \
+;;;       Null     NonNull
+;;;          \       /
+;;;          Bottom (unreachable)
+;;; ─────────────────────────────────────────────────────────────────────
+
+(declare-abstract-domain null-state
+  :elements  (bottom null nonnull maybenull top)
+  :ordering  ((bottom < null)
+              (bottom < nonnull)
+              (null < maybenull)
+              (nonnull < maybenull)
+              (maybenull < top))
+  :join      lattice-join
+  :meet      lattice-meet
+  :bottom    bottom
+  :top       top)
+
+(declare-abstract-domain null-state-map
+  :type (map int null-state)
+  :join map-join
+  :doc  "Maps variable ID → null-state. Join is pointwise lattice join.")
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; PHASE 1: Collect Events
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule NP-collect-derefs
+  :doc "Identify pointer dereferences via *, ->, and []."
+  :phase collect
+
+  :pattern
+    (or
+      ;; Unary *p
+      (ast-match (deref ?ptr)
+        :where (is-pointer-type ?ptr))
+      ;; p->field (represented as . with originalName ->)
+      (ast-match (member-access ?ptr ?field)
+        :where (is-arrow-access ?ptr)
+        :where (is-pointer-type ?ptr))
+      ;; p[i]
+      (ast-match (subscript ?ptr ?index)
+        :where (is-pointer-type ?ptr)))
+
+  :action
+    (let ((kind (match-case
+                  ((deref _)          'star)
+                  ((member-access _ _) 'arrow)
+                  ((subscript _ _)    'subscript))))
+      (set-fact deref-site
+        :var-id    (var-id ?ptr)
+        :var-name  (token-str ?ptr)
+        :location  (current-location)
+        :scope-id  (current-scope-id)
+        :deref-kind kind)))
+
+(rule NP-collect-null-checks
+  :doc "Identify comparisons against null: p == NULL, p != NULL, !p, if(p)."
+  :phase collect
+
+  :pattern
+    (or
+      ;; p == NULL / NULL == p
+      (ast-match (== ?a ?b)
+        :where (or (and (is-pointer-var ?a) (is-null-literal ?b))
+                   (and (is-null-literal ?a) (is-pointer-var ?b))))
+      ;; p != NULL / NULL != p
+      (ast-match (!= ?a ?b)
+        :where (or (and (is-pointer-var ?a) (is-null-literal ?b))
+                   (and (is-null-literal ?a) (is-pointer-var ?b))))
+      ;; !p (unary negation of pointer)
+      (ast-match (not ?p)
+        :where (is-pointer-type ?p)))
+
+  :action
+    (let* ((ptr-tok (match-case
+                      ((== ?a ?b) (if (is-pointer-var ?a) ?a ?b))
+                      ((!= ?a ?b) (if (is-pointer-var ?a) ?a ?b))
+                      ((not ?p)   ?p)))
+           (eq-null (match-case
+                      ((== _ _) #t)
+                      ((!= _ _) #f)
+                      ((not _)  #t))))
+      (set-fact null-check
+        :var-id      (var-id ptr-tok)
+        :var-name    (token-str ptr-tok)
+        :location    (current-location)
+        :scope-id    (current-scope-id)
+        :is-eq-null  eq-null
+        :is-negation (match-case ((not _) #t) (_ #f)))))
+
+(rule NP-collect-null-assigns
+  :doc "Identify assignments of null to pointer variables."
+  :phase collect
+
+  :pattern
+    (ast-match (assign ?lhs ?rhs)
+      :where (is-null-literal ?rhs)
+      :where (has-var-id ?lhs))
+
+  :action
+    (set-fact null-assignment
+      :var-id    (var-id ?lhs)
+      :var-name  (token-str ?lhs)
+      :location  (current-location)
+      :scope-id  (current-scope-id)))
+
+(rule NP-collect-null-return-calls
+  :doc "Identify calls to functions that may return null."
+  :phase collect
+
+  :pattern
+    (ast-match (call ?callee ?args)
+      :where (is-may-return-null-function ?callee))
+
+  :action
+    (let* ((info       (may-return-null-info (token-str ?callee)))
+           (parent     (ast-parent (current-token)))
+           (lhs-info   (if (and parent (is-assignment parent))
+                            (let ((lhs (ast-operand1 parent)))
+                              (list (var-id lhs) (token-str lhs)))
+                            (list nil ""))))
+      (set-fact null-return-call
+        :func-name      (token-str ?callee)
+        :return-reason  (reason info)
+        :assigned-var-id   (first lhs-info)
+        :assigned-var-name (second lhs-info)
+        :location       (current-location)
+        :scope-id       (current-scope-id))))
+
+(rule NP-collect-nonnull-arg-passes
+  :doc "Identify passing null literals to non-null parameters."
+  :phase collect
+
+  :pattern
+    (ast-match (call ?callee ?args)
+      :where (has-non-null-params ?callee))
+
+  :action
+    (let ((required (non-null-param-indices (token-str ?callee)))
+          (arg-list (flatten-call-args ?args)))
+      (for-each (idx <- required)
+        (when (and (< idx (length arg-list))
+                   (is-null-literal (nth idx arg-list)))
+          (set-fact non-null-arg-pass
+            :func-name   (token-str ?callee)
+            :param-index idx
+            :arg-var-name (token-str (nth idx arg-list))
+            :arg-var-id  (try-var-id (nth idx arg-list))
+            :location    (current-location)
+            :scope-id    (current-scope-id))))))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; PHASE 2: Null-State Dataflow Analysis
+;;; ═══════════════════════════════════════════════════════════════════
+
+(declare-dataflow-analysis null-state-analysis
+  :domain    null-state-map
+  :direction forward
+  :meet      map-join                  ;; join at merge points
+  :init      (empty-map)
+  :boundary  (empty-map)
+
+  :transfer
+    (lambda (node state-in)
+      (fold-tokens node state-in
+        (lambda (tok state)
+          (cond
+            ;; p = NULL / nullptr / 0
+            ((and (is-assignment tok)
+                  (is-null-literal (rhs tok))
+                  (has-var-id (lhs tok)))
+             (map-set state (var-id (lhs tok)) 'null))
+
+            ;; p = &x (address-of → non-null)
+            ((and (is-assignment tok)
+                  (is-address-of (rhs tok))
+                  (has-var-id (lhs tok)))
+             (map-set state (var-id (lhs tok)) 'nonnull))
+
+            ;; p = may_return_null(...)
+            ((and (is-assignment tok)
+                  (is-call (rhs tok))
+                  (is-may-return-null-function (callee (rhs tok)))
+                  (has-var-id (lhs tok)))
+             (map-set state (var-id (lhs tok)) 'maybenull))
+
+            ;; p = other_function(...)
+            ((and (is-assignment tok)
+                  (is-call (rhs tok))
+                  (not (is-may-return-null-function (callee (rhs tok))))
+                  (has-var-id (lhs tok)))
+             (map-set state (var-id (lhs tok)) 'nonnull))
+
+            ;; p = q (copy state)
+            ((and (is-assignment tok)
+                  (has-var-id (lhs tok))
+                  (has-var-id (rhs tok)))
+             (map-set state (var-id (lhs tok))
+                      (map-get state (var-id (rhs tok)) 'top)))
+
+            ;; p = non-null-expr (general non-null assignment)
+            ((and (is-assignment tok)
+                  (has-var-id (lhs tok))
+                  (not (is-null-literal (rhs tok)))
+                  (not (is-call (rhs tok)))
+                  (not (has-var-id (rhs tok))))
+             (map-set state (var-id (lhs tok)) 'top))
+
+            ;; Default: no change
+            (else state)))))
+
+  :branch-refine
+    (lambda (condition true-state false-state)
+      (cond
+        ;; if (p == NULL) → true: p=null, false: p=nonnull
+        ((and (is-eq-null condition)
+              (has-var-id (checked-ptr condition)))
+         (values
+           (map-set true-state  (var-id (checked-ptr condition)) 'null)
+           (map-set false-state (var-id (checked-ptr condition)) 'nonnull)))
+
+        ;; if (p != NULL) → true: p=nonnull, false: p=null
+        ((and (is-neq-null condition)
+              (has-var-id (checked-ptr condition)))
+         (values
+           (map-set true-state  (var-id (checked-ptr condition)) 'nonnull)
+           (map-set false-state (var-id (checked-ptr condition)) 'null)))
+
+        ;; if (p) → true: p=nonnull, false: p=null
+        ((and (is-pointer-condition condition)
+              (has-var-id (checked-ptr condition)))
+         (values
+           (map-set true-state  (var-id (checked-ptr condition)) 'nonnull)
+           (map-set false-state (var-id (checked-ptr condition)) 'null)))
+
+        ;; if (!p) → true: p=null, false: p=nonnull
+        ((and (is-negated-pointer-condition condition)
+              (has-var-id (checked-ptr condition)))
+         (values
+           (map-set true-state  (var-id (checked-ptr condition)) 'null)
+           (map-set false-state (var-id (checked-ptr condition)) 'nonnull)))
+
+        ;; Default: no refinement
+        (else (values true-state false-state)))))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE NP01 — Definite Null Dereference
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule NP01-report
+  :doc "Report when a pointer is provably null at the point of dereference."
+  :phase report
+  :requires (NP-collect-derefs null-state-analysis)
+
+  :pattern
+    (fact-match deref-site ?ds)
+
+  :constraint
+    (let ((state (dataflow-query null-state-analysis
+                   :at (location ?ds)
+                   :var (var-id ?ds))))
+      (= state 'null))
+
+  :action
+    (report
+      :id       "nullptrMisuse.NP01"
+      :severity error
+      :location (location ?ds)
+      :message  (format
+        "null pointer dereference: '~a' is NULL when dereferenced via '~a'"
+        (var-name ?ds)
+        (deref-kind-str (deref-kind ?ds)))
+      :cwe 476))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE NP02 — Dereference Before Null Check
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule NP02-report
+  :doc "Report when a pointer is dereferenced before being checked for null."
+  :phase report
+  :requires (NP-collect-derefs NP-collect-null-checks)
+
+  :pattern
+    (and
+      (fact-match deref-site ?ds)
+      (fact-match null-check ?nc
+        :where (= (var-id ?nc) (var-id ?ds))
+        :where (= (scope-id ?nc) (scope-id ?ds))
+        :where (location-after (location ?nc) (location ?ds))))
+
+  :constraint
+    (not (exists (fact-match null-assignment ?na
+            :where (= (var-id ?na) (var-id ?ds))
+            :where (= (scope-id ?na) (scope-id ?ds))
+            :where (location-between (location ?na)
+                                     (location ?ds)
+                                     (location ?nc)))))
+
+  :action
+    (report
+      :id       "nullptrMisuse.NP02"
+      :severity error
+      :location (location ?ds)
+      :message  (format
+        "pointer '~a' is dereferenced at line ~a but checked for null at line ~a — if null, the dereference is undefined behaviour"
+        (var-name ?nc)
+        (line (location ?ds))
+        (line (location ?nc)))
+      :cwe 476))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE NP03 — Null Return Not Checked
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule NP03-report
+  :doc "Report when a may-return-null function's result is used without a null check."
+  :phase report
+  :requires (NP-collect-null-return-calls NP-collect-derefs NP-collect-null-checks)
+
+  :pattern
+    (and
+      (fact-match null-return-call ?nrc
+        :where (not (nil? (assigned-var-id ?nrc))))
+      (fact-match deref-site ?ds
+        :where (= (var-id ?ds) (assigned-var-id ?nrc))
+        :where (= (scope-id ?ds) (scope-id ?nrc))
+        :where (location-after (location ?ds) (location ?nrc))))
+
+  :constraint
+    (not (exists (fact-match null-check ?nc
+            :where (= (var-id ?nc) (assigned-var-id ?nrc))
+            :where (= (scope-id ?nc) (scope-id ?nrc))
+            :where (location-between (location ?nc)
+                                     (location ?nrc)
+                                     (location ?ds)))))
+
+  :action
+    (let ((first-deref (min-by location
+                         (select deref-site
+                           :where (and (= (var-id _) (assigned-var-id ?nrc))
+                                       (= (scope-id _) (scope-id ?nrc))
+                                       (location-after (location _) (location ?nrc)))))))
+      (report
+        :id       "nullptrMisuse.NP03"
+        :severity warning
+        :location (location ?nrc)
+        :message  (format
+          "return value of '~a' (~a) is stored in '~a' and dereferenced at line ~a without a null check"
+          (func-name ?nrc)
+          (return-reason ?nrc)
+          (assigned-var-name ?nrc)
+          (line (location first-deref)))
+        :cwe 690)))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE NP04 — Redundant Null Check
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule NP04-report
+  :doc "Report when a pointer cannot be null at the point of a null check."
+  :phase report
+  :requires (NP-collect-null-checks null-state-analysis)
+
+  :pattern
+    (fact-match null-check ?nc)
+
+  :constraint
+    (let ((state (dataflow-query null-state-analysis
+                   :at (location ?nc)
+                   :var (var-id ?nc))))
+      (= state 'nonnull))
+
+  :action
+    (report
+      :id       "nullptrMisuse.NP04"
+      :severity style
+      :location (location ?nc)
+      :message  (format
+        "redundant null check: '~a' cannot be null at this point"
+        (var-name ?nc))))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE NP05 — Null Passed to Non-null Parameter
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule NP05-literal
+  :doc "Report null literals passed to non-null parameters."
+  :phase report
+  :requires (NP-collect-nonnull-arg-passes)
+
+  :pattern
+    (fact-match non-null-arg-pass ?nap)
+
+  :action
+    (report
+      :id       "nullptrMisuse.NP05"
+      :severity error
+      :location (location ?nap)
+      :message  (format
+        "null value '~a' passed as argument ~a to '~a', which requires a non-null pointer"
+        (arg-var-name ?nap)
+        (+ (param-index ?nap) 1)
+        (func-name ?nap))
+      :cwe 476))
+
+(rule NP05-provably-null
+  :doc "Report provably-null variables passed to non-null parameters."
+  :phase report
+  :requires (NP-collect-nonnull-arg-passes null-state-analysis)
+
+  :pattern
+    (ast-match (call ?callee ?args)
+      :where (has-non-null-params ?callee))
+
+  :constraint
+    (let* ((required (non-null-param-indices (token-str ?callee)))
+           (arg-list (flatten-call-args ?args)))
+      (exists (idx <- required)
+        (and (< idx (length arg-list))
+             (has-var-id (nth idx arg-list))
+             (= 'null
+                (dataflow-query null-state-analysis
+                  :at (current-location)
+                  :var (var-id (nth idx arg-list)))))))
+
+  :action
+    (let* ((required (non-null-param-indices (token-str ?callee)))
+           (arg-list (flatten-call-args ?args)))
+      (for-each (idx <- required)
+        (when (and (< idx (length arg-list))
+                   (has-var-id (nth idx arg-list))
+                   (= 'null
+                      (dataflow-query null-state-analysis
+                        :at (current-location)
+                        :var (var-id (nth idx arg-list)))))
+          (report
+            :id       "nullptrMisuse.NP05"
+            :severity error
+            :location (current-location)
+            :message  (format
+              "pointer '~a' is NULL when passed as argument ~a to '~a', which requires a non-null pointer"
+              (token-str (nth idx arg-list))
+              (+ idx 1)
+              (token-str ?callee))
+            :cwe 476)))))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE NP06 — Null Arithmetic
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule NP06-report
+  :doc "Report arithmetic performed on a null pointer."
+  :phase report
+  :requires (null-state-analysis)
+
+  :pattern
+    (ast-match (arith-op ?op ?ptr ?offset)
+      :where (member ?op (+ -))
+      :where (is-pointer-type ?ptr)
+      :where (has-var-id ?ptr))
+
+  :constraint
+    (= 'null
+       (dataflow-query null-state-analysis
+         :at (current-location)
+         :var (var-id ?ptr)))
+
+  :action
+    (report
+      :id       "nullptrMisuse.NP06"
+      :severity warning
+      :location (current-location)
+      :message  (format
+        "arithmetic on null pointer '~a': this is undefined behaviour"
+        (token-str ?ptr))
+      :cwe 476))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE NP07 — Null Assigned Then Dereferenced
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule NP07-report
+  :doc "Report when null is assigned and then dereferenced without reassignment."
+  :phase report
+  :requires (NP-collect-null-assigns NP-collect-derefs NP-collect-null-checks)
+
+  :pattern
+    (and
+      (fact-match null-assignment ?na)
+      (fact-match deref-site ?ds
+        :where (= (var-id ?ds) (var-id ?na))
+        :where (= (scope-id ?ds) (scope-id ?na))
+        :where (location-after (location ?ds) (location ?na))))
+
+  :constraint
+    (and
+      ;; No intervening non-null assignment
+      (not (exists (ast-match (assign ?lhs ?rhs)
+              :where (= (var-id ?lhs) (var-id ?na))
+              :where (not (is-null-literal ?rhs))
+              :where (location-between (current-location)
+                                       (location ?na)
+                                       (location ?ds)))))
+      ;; No intervening null check (which implies a guarding branch)
+      (not (exists (fact-match null-check ?nc
+              :where (= (var-id ?nc) (var-id ?na))
+              :where (= (scope-id ?nc) (scope-id ?na))
+              :where (location-between (location ?nc)
+                                       (location ?na)
+                                       (location ?ds))))))
+
+  :action
+    (let ((first-deref (min-by location
+                         (select deref-site
+                           :where (and (= (var-id _) (var-id ?na))
+                                       (= (scope-id _) (scope-id ?na))
+                                       (location-after (location _)
+                                                       (location ?na)))))))
+      (report
+        :id       "nullptrMisuse.NP07"
+        :severity error
+        :location (location ?na)
+        :message  (format
+          "'~a' is assigned null at line ~a, then dereferenced via '~a' at line ~a without reassignment"
+          (var-name ?na)
+          (line (location ?na))
+          (deref-kind-str (deref-kind first-deref))
+          (line (location first-deref)))
+        :cwe 476)))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; RULE NP08 — Tautological Double Null Check
+;;; ═══════════════════════════════════════════════════════════════════
+
+(rule NP08-report
+  :doc "Report same pointer tested for null twice with no intervening reassignment."
+  :phase report
+  :requires (NP-collect-null-checks NP-collect-null-assigns)
+
+  :pattern
+    (and
+      (fact-match null-check ?nc1)
+      (fact-match null-check ?nc2
+        :where (= (var-id ?nc2) (var-id ?nc1))
+        :where (= (scope-id ?nc2) (scope-id ?nc1))
+        :where (= (is-eq-null ?nc2) (is-eq-null ?nc1))
+        :where (location-after (location ?nc2) (location ?nc1))
+        :where (not (= ?nc1 ?nc2))))
+
+  :constraint
+    (not (exists (fact-match null-assignment ?na
+            :where (= (var-id ?na) (var-id ?nc1))
+            :where (= (scope-id ?na) (scope-id ?nc1))
+            :where (location-between (location ?na)
+                                     (location ?nc1)
+                                     (location ?nc2)))))
+
+  :action
+    (let ((check-kind (if (is-eq-null ?nc2) "== null" "!= null")))
+      (report
+        :id       "nullptrMisuse.NP08"
+        :severity style
+        :location (location ?nc2)
+        :message  (format
+          "tautological null check: '~a ~a' was already tested at line ~a with no intervening reassignment"
+          (var-name ?nc2)
+          check-kind
+          (line (location ?nc1))))))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; Helper Functions
+;;; ═══════════════════════════════════════════════════════════════════
+
+(define-function deref-kind-str (kind)
+  :doc "Convert deref-kind symbol to display string."
+  (case kind
+    (star      "*")
+    (arrow     "->")
+    (subscript "[]")
+    (else      "?")))
+
+(define-function location-after (loc-a loc-b)
+  :doc "True if loc-a is after loc-b in source order."
+  (or (> (line loc-a) (line loc-b))
+      (and (= (line loc-a) (line loc-b))
+           (> (column loc-a) (column loc-b)))))
+
+(define-function location-between (loc loc-start loc-end)
+  :doc "True if loc is strictly between loc-start and loc-end."
+  (and (location-after loc loc-start)
+       (location-after loc-end loc)))
+
+(define-function is-pointer-var (tok)
+  :doc "True if tok is a named variable with pointer type."
+  (and (has-var-id tok)
+       (is-pointer-type tok)))
+
+(define-function is-null-literal (tok)
+  :doc "True if tok is a null literal (nullptr, NULL, 0, etc.)."
+  (or (member (token-str tok) (null-literal-set))
+      (and (has-known-int-value tok)
+           (= (known-int-value tok) 0))))
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; Suppression Directives
+;;; ═══════════════════════════════════════════════════════════════════
+
+(suppress-on-comment
+  :pattern "// NOLINTNEXTLINE(nullptr)"
+  :scope   next-line
+  :rules   (NP01 NP02 NP03 NP04 NP05 NP06 NP07 NP08))
+
+(suppress-on-comment
+  :pattern "// NOLINT(nullptr)"
+  :scope   same-line
+  :rules   (NP01 NP02 NP03 NP04 NP05 NP06 NP07 NP08))
+
+(suppress-on-attribute
+  :pattern "__attribute__((nonnull))"
+  :scope   function-params
+  :rules   (NP05)
+  :doc     "GCC nonnull attribute on function parameters.")
+
+(suppress-on-attribute
+  :pattern "_Nonnull"
+  :scope   variable
+  :rules   (NP01 NP04)
+  :doc     "Clang nullability annotation.")
+
+
+;;; ═══════════════════════════════════════════════════════════════════
+;;; Configuration
+;;; ═══════════════════════════════════════════════════════════════════
+
+(config
+  :max-worklist-iterations      500
+  :max-tokens-per-scope         50000
+  :user-may-return-null-file    "may_return_null.txt"
+  :user-non-null-params-file    "non_null_params.txt"
+  :treat-unknown-as             maybenull       ;; conservative default
+  )
