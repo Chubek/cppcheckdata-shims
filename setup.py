@@ -26,9 +26,9 @@ from setuptools import setup, find_packages
 
 # ---------------------------------------------------------------------------
 #  Read version from pyproject.toml so we have a single source of truth.
-#  We do a minimal regex parse to avoid importing tomllib (3.11+) or toml.
 # ---------------------------------------------------------------------------
 _HERE = Path(__file__).resolve().parent
+
 
 def _read_version() -> str:
     """Extract the version string from pyproject.toml."""
@@ -39,12 +39,14 @@ def _read_version() -> str:
         return match.group(1)
     return "0.0.0"
 
+
 def _read_long_description() -> str:
     """Read README.md for the long description."""
     readme = _HERE / "README.md"
     if readme.exists():
         return readme.read_text(encoding="utf-8")
     return ""
+
 
 def _read_requirements() -> list[str]:
     """Read requirements.txt if it exists."""
@@ -58,8 +60,20 @@ def _read_requirements() -> list[str]:
         ]
     return []
 
+
 # ---------------------------------------------------------------------------
 #  Main setup() call — mirrors pyproject.toml but keeps legacy compat.
+#
+#  KEY FIX:  Removed  scripts=["bin/casl"]
+#
+#    That parameter told setuptools to physically copy bin/casl into
+#    build/scripts-3.14/ during install.  If the file didn't exist (or
+#    the path was wrong), setuptools raised:
+#
+#        Error: [Errno 2] No such file or directory: 'build/scripts-3.14/casl'
+#
+#    The `casl` CLI is correctly exposed via entry_points/console_scripts
+#    below, which auto-generates a wrapper — no physical script needed.
 # ---------------------------------------------------------------------------
 setup(
     name="cppcheckdata-shims",
@@ -118,12 +132,20 @@ setup(
             "graphviz>=0.20",
         ],
     },
+
+    # ── THIS is the only CLI mechanism needed ──────────────────────────
+    #  setuptools creates a platform-appropriate wrapper that calls
+    #  casl.__main__:main — no physical bin/casl file required.
     entry_points={
         "console_scripts": [
             "casl=casl.__main__:main",
         ],
     },
-    scripts=["bin/casl"],
+
+    # ── REMOVED — was the cause of the Errno 2 error ──────────────────
+    #  scripts=["bin/casl"],    # ← DO NOT USE — needs a physical file
+    #                           #    and duplicates what entry_points does
+
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",

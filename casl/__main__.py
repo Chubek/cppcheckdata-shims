@@ -1,19 +1,3 @@
-
-
-# `casl/__main__.py` — CASL Entry Point
-
-This is the CLI entry point for the CASL toolchain. It handles argument parsing, orchestrates the full pipeline (parse → semantic analysis → code generation), and provides diagnostics, introspection, and shim code generation.
-
-I need to study the existing modules carefully to ensure correct integration. Let me trace through the pipeline:
-
-1. **`casl/parser.py`** — `parse(source: str) -> A.AddonSpec`
-2. **`casl/semantic.py`** — `SemanticAnalyzer.analyze(spec: A.AddonSpec) -> SemanticContext`
-3. **`casl/codegen.py`** — `CodeGenerator.generate(spec, ctx) -> GeneratedAddon`
-4. **`casl/runtime.py`** — `CASLRuntime` for direct execution
-5. **`casl/errors.py`** — `DiagnosticCollector` for error reporting
-6. **`cppcheckdata.py`** — the target we generate shims against
-
-```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -1829,47 +1813,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-```
-
----
-
-## Architecture Notes
-
-### Pipeline Flow
-
-The CLI orchestrates this pipeline:
-
-$$
-\text{.casl source} \xrightarrow{\text{parse}} \text{AST} \xrightarrow{\text{analyze}} \text{AST + Context} \xrightarrow{\text{generate}} \text{Python addon}
-$$
-
-Each phase is independently timed and reports diagnostics through the shared `DiagnosticFormatter`.
-
-### Command Matrix
-
-| Command | Parse | Analyze | Codegen | Execute |
-|---------|-------|---------|---------|---------|
-| `compile` | ✅ | ✅ | ✅ | ❌ |
-| `check` | ✅ | ✅ | ❌ | ❌ |
-| `dump-ast` | ✅ | ❌ | ❌ | ❌ |
-| `dump-sexp` | ✅ | ❌ | ❌ | ❌ |
-| `run` | ✅ | ✅ | ✅ | ✅ |
-| `info` | ✅ | ❌ | ❌ | ❌ |
-| `init` | ❌ | ❌ | ❌ | ❌ |
-
-### Key Design Decisions
-
-1. **Lazy imports**: Heavy modules (`parser`, `semantic`, `codegen`, `runtime`) are imported only when needed. Running `casl --help` is instant.
-
-2. **GCC/Clang-style diagnostics**: Errors include file, line, column, source context, and carets — matching what C/C++ developers expect from Cppcheck's ecosystem.
-
-3. **Source map generation**: The `--source-map` flag produces a JSON mapping from generated Python line numbers back to CASL source locations, enabling debuggability of generated code.
-
-4. **S-expression round-tripping**: `dump-sexp` canonicalizes CASL specifications, enabling:
-   - Normalization before diff
-   - Automated refactoring
-   - Macro expansion verification
-
-5. **Direct execution via `run`**: Compiles to Python code in memory, `exec()`s it, and feeds Cppcheck dump data through the generated `check()` function — no intermediate file needed.
-
-6. **Skeleton generation**: `init` produces a well-commented starter specification that demonstrates all major CASL constructs, lowering the barrier to entry.

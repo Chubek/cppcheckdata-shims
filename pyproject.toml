@@ -52,9 +52,6 @@ classifiers = [
 
 # ── Runtime dependencies ────────────────────────────────────────────────────
 dependencies = []
-# The library is intentionally zero-dependency at runtime.
-# cppcheckdata.py itself is vendored by Cppcheck and is expected to live
-# on sys.path (or be supplied by the host project).
 
 # ── Optional / extra dependency groups ──────────────────────────────────────
 [project.optional-dependencies]
@@ -76,21 +73,26 @@ viz = [
 ]
 
 # ── Entry points ────────────────────────────────────────────────────────────
+#
+#  This is the ONLY mechanism needed to expose the `casl` CLI command.
+#  setuptools will auto-generate a platform-appropriate wrapper script
+#  (e.g. /usr/local/bin/casl on Linux, Scripts\casl.exe on Windows)
+#  that calls casl.__main__:main.
+#
+#  NO scripts= and NO [tool.setuptools.data-files] for bin/casl needed.
+#
 [project.scripts]
-# The `casl` CLI compiler / runner
 casl = "casl.__main__:main"
 
 # ── Project URLs ────────────────────────────────────────────────────────────
 [project.urls]
-Homepage    = "https://github.com/user/cppcheckdata-shims"
-Repository  = "https://github.com/user/cppcheckdata-shims"
-Issues      = "https://github.com/user/cppcheckdata-shims/issues"
+Homepage      = "https://github.com/user/cppcheckdata-shims"
+Repository    = "https://github.com/user/cppcheckdata-shims"
+Issues        = "https://github.com/user/cppcheckdata-shims/issues"
 Documentation = "https://github.com/user/cppcheckdata-shims/tree/main/docs"
 
 # ── Setuptools-specific configuration ──────────────────────────────────────
 [tool.setuptools]
-# Automatically discover all packages (cppcheckdata_shims, casl, tests)
-# but exclude tests, scripts, docs, and build artefacts from the wheel.
 
 [tool.setuptools.packages.find]
 include = [
@@ -109,26 +111,29 @@ exclude = [
 ]
 
 [tool.setuptools.package-data]
-# Include py.typed markers if/when we add them
 cppcheckdata_shims = ["py.typed"]
 casl               = ["py.typed"]
 
-# Ship the bin/casl wrapper script inside sdists
-[tool.setuptools.data-files]
-"bin" = ["bin/casl"]
+# ════════════════════════════════════════════════════════════════════════════
+#  REMOVED — this was the root cause of the build error:
+#
+#  [tool.setuptools.data-files]
+#  "bin" = ["bin/casl"]          # ← tried to copy a physical file that
+#                                #   may not exist; completely unnecessary
+#                                #   because [project.scripts] already
+#                                #   creates the CLI wrapper.
+# ════════════════════════════════════════════════════════════════════════════
 
 # ── Tool configuration ─────────────────────────────────────────────────────
 
-# -- pytest --
 [tool.pytest.ini_options]
-testpaths   = ["tests"]
-addopts     = "-v --tb=short --strict-markers"
-markers     = [
+testpaths = ["tests"]
+addopts   = "-v --tb=short --strict-markers"
+markers   = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "e2e:  end-to-end integration tests",
 ]
 
-# -- coverage --
 [tool.coverage.run]
 source = ["cppcheckdata_shims", "casl"]
 branch = true
@@ -138,50 +143,38 @@ show_missing = true
 skip_empty   = true
 fail_under   = 60
 
-# -- ruff (linter + formatter) --
 [tool.ruff]
 target-version = "py310"
 line-length    = 100
 
 [tool.ruff.lint]
 select = [
-    "E",    # pycodestyle errors
-    "W",    # pycodestyle warnings
-    "F",    # pyflakes
-    "I",    # isort
-    "N",    # pep8-naming
-    "UP",   # pyupgrade
-    "B",    # flake8-bugbear
-    "SIM",  # flake8-simplify
-    "RUF",  # ruff-specific rules
+    "E", "W", "F", "I", "N", "UP", "B", "SIM", "RUF",
 ]
 ignore = [
-    "E501",   # line too long — handled by formatter
-    "B905",   # zip-strict — not always wanted
+    "E501",
+    "B905",
 ]
 
 [tool.ruff.lint.isort]
 known-first-party = ["cppcheckdata_shims", "casl"]
 
-# -- mypy --
 [tool.mypy]
-python_version       = "3.10"
-warn_return_any      = true
-warn_unused_configs  = true
-disallow_untyped_defs = false        # relax for now; tighten later
-ignore_missing_imports = true        # cppcheckdata is untyped
+python_version         = "3.10"
+warn_return_any        = true
+warn_unused_configs    = true
+disallow_untyped_defs  = false
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
 
-# -- black (if used instead of ruff format) --
 [tool.black]
 target-version = ["py310"]
 line-length    = 100
 
-# -- isort (if used standalone) --
 [tool.isort]
-profile          = "black"
-line_length      = 100
+profile           = "black"
+line_length       = 100
 known_first_party = ["cppcheckdata_shims", "casl"]
