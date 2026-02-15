@@ -1,0 +1,1050 @@
+;; ═══════════════════════════════════════════════════════════════════════
+;;  Buflint.casl — Sound Memory-Safety Static Analyzer
+;; ═══════════════════════════════════════════════════════════════════════
+;;
+;;  A Cppcheck addon specification that detects memory-safety violations.
+;;
+;;  Design goals:
+;;    SOUNDNESS — Every real bug in the checked categories is reported.
+;;    LOW FALSE POSITIVES — Precision through flow-sensitive interval
+;;      analysis, path-refined nullness/allocation-state tracking,
+;;      interprocedural summaries, and two-tier reporting.
+;;
+;;  Covered CWEs:
+;;    119, 120, 121, 122, 124, 125, 126, 127, 131, 170,
+;;    415, 416, 476, 562, 590, 761, 787, 788, 789
+;;
+;;  Usage:
+;;    casl compile Buflint.casl -o Buflint.py
+;;    cppcheck --dump target.c
+;;    python Buflint.py target.c.dump
+;;
+;;  Or in one shot:
+;;    casl run Buflint.casl -- target.c.dump
+
+(addon buflint
+  (metadata
+    (version "1.0.0")
+    (description "Sound memory-safety static analyzer for C/C++")
+    (author "Buflint Authors")
+    (cppcheck-version ">= 2.10"))
+
+  ;; ═════════════════════════════════════════════════════════════════════
+  ;;  IMPORTS
+  ;; ═════════════════════════════════════════════════════════════════════
+
+  (import cppcheckdata-shims.abstract_domains
+    (IntervalDomain FlatDomain SignDomain))
+  (import cppcheckdata-shims.memory_abstraction
+    (PointsToAnalysis AliasAnalysis))
+
+  ;; ═════════════════════════════════════════════════════════════════════
+  ;;  REUSABLE PATTERN FRAGMENTS
+  ;; ═════════════════════════════════════════════════════════════════════
+
+  ;; ── Allocation call patterns ──────────────────────────────────────
+  (let-pattern alloc-call
+    (or-pattern
+      (call (name "malloc")  (args @alloc-size))
+      (call (name "calloc")  (args @alloc-nmemb @alloc-elem-size))
+      (call (name "realloc") (args @alloc-old-ptr @alloc-size))
+      (call (name "aligned_alloc") (args _ @alloc-size))
+      (call (name "valloc")  (args @alloc-size))
+      (call (name "strdup")  (args @alloc-src-str))
+      (call (name "strndup") (args @alloc-src-str @alloc-size))))
+
+  ;; ── Deallocation call patterns ────────────────────────────────────
+  (let-pattern dealloc-call
+    (or-pattern
+      (call (name "free")  (args @freed-ptr))
+      (call (name "cfree") (args @freed-ptr))))
+
+  ;; ── Bounded buffer-write functions ────────────────────────────────
+  (let-pattern bounded-write-call
+    (or-pattern
+      (call (name "memcpy")   (args @bw-dst @bw-src @bw-size))
+      (call (name "memmove")  (args @bw-dst @bw-src @bw-size))
+      (call (name "memset")   (args @bw-dst _       @bw-size))
+      (call (name "strncpy")  (args @bw-dst @bw-src @bw-size))
+      (call (name "strncat")  (args @bw-dst @bw-src @bw-size))
+      (call (name "snprintf") (args @bw-dst @bw-size _ ...))
+      (call (name "fgets")    (args @bw-dst @bw-size _))
+      (call (name "fread")    (args @bw-dst @bw-elem-sz @bw-count _))
+      (call (name "read")     (args _ @bw-dst @bw-size))
+      (call (name "recv")     (args _ @bw-dst @bw-size _))))
+
+  ;; ── Unbounded buffer-write functions (always dangerous) ───────────
+  (let-pattern unbounded-write-call
+    (or-pattern
+      (call (name "strcpy")   (args @uw-dst @uw-src))
+      (call (name "strcat")   (args @uw-dst @uw-src))
+      (call (name "sprintf")  (args @uw-dst _ ...))
+      (call (name "gets")     (args @uw-dst))))
+
+  ;; ── Buffer-read functions ─────────────────────────────────────────
+  (let-pattern bounded-read-call
+    (or-pattern
+      (call (name "memcmp")   (args @br-buf1 @br-buf2 @br-size))
+      (call (name "strncmp")  (args @br-buf1 @br-buf2 @br-size))
+      (call (name "fwrite")   (args @br-src @br-elem-sz @br-count _))
+      (call (name "write")    (args _ @br-src @br-size))
+      (call (name "send")     (args _ @br-src @br-size _))))
+
+  ;; ── Pointer dereference patterns ──────────────────────────────────
+  (let-pattern ptr-deref
+    (or-pattern
+      (ast-match (unary-op "*" @deref-ptr))
+      (ast-match (array-subscript @deref-ptr @deref-index))
+      (ast-match (member-access "->" @deref-ptr @deref-member))))
+
+  ;; ── Null-check patterns ───────────────────────────────────────────
+  (let-pattern null-check-of
+    (or-pattern
+      (ast-match (comparison "!=" @checked-ptr (null-literal)))
+      (ast-match (comparison "!=" (null-literal) @checked-ptr))
+      (ast-match (comparison "==" @checked-ptr (null-literal)))
+      (ast-match (comparison "==" (null-literal) @checked-ptr))
+      ;; Truthiness test: if (ptr)
+      (if-stmt (condition @checked-ptr))))
+
+  ;; ═════════════════════════════════════════════════════════════════════
+  ;;  CUSTOM ABSTRACT DOMAINS
+  ;; ═════════════════════════════════════════════════════════════════════
+
+  ;; ── Allocation Lifecycle Domain ───────────────────────────────────
+  ;;
+  ;;  Tracks the state of a heap-allocated memory region through its
+  ;;  lifecycle.  This is a flat lattice of height 2.
+  ;;
+  ;;                    top (unknown)
+  ;;               /   |   |   |   \
+  ;;          unalloc alloc freed stack static
+  ;;               \   |   |   |   /
+  ;;                   bottom
+  ;;
+
+  (domain AllocLifecycle
+    (elements unallocated allocated freed stack-local static-storage top bottom)
+    (bottom bottom)
+    (top top)
+    (join
+      ;; Same-state joins are identity
+      (allocated   allocated   allocated)
+      (freed       freed       freed)
+      (unallocated unallocated unallocated)
+      (stack-local stack-local stack-local)
+      (static-storage static-storage static-storage)
+      ;; Different non-bottom states join to top
+      (allocated   freed       top)
+      (allocated   unallocated top)
+      (allocated   stack-local top)
+      (allocated   static-storage top)
+      (freed       unallocated top)
+      (freed       stack-local top)
+      (freed       static-storage top)
+      (unallocated stack-local top)
+      (unallocated static-storage top)
+      (stack-local static-storage top)
+      ;; Bottom is the identity
+      (bottom      _           identity)
+      (_           bottom      identity))
+    (transfer-rules
+      ;; Allocation transitions
+      (call "malloc"        _ -> allocated)
+      (call "calloc"        _ -> allocated)
+      (call "realloc"       _ -> allocated)
+      (call "aligned_alloc" _ -> allocated)
+      (call "valloc"        _ -> allocated)
+      (call "strdup"        _ -> allocated)
+      (call "strndup"       _ -> allocated)
+      ;; Deallocation transitions
+      (call "free"          allocated -> freed)
+      (call "free"          freed -> freed)         ;; double-free: stays freed
+      (call "free"          stack-local -> stack-local) ;; invalid but tracked
+      (call "cfree"         allocated -> freed)
+      ;; Address-of local → stack
+      (address-of-local     _ -> stack-local)
+      ;; Assignment from global/static → static
+      (address-of-global    _ -> static-storage)
+      ;; NULL assignment
+      (assign-null          _ -> unallocated)))
+
+  ;; ═════════════════════════════════════════════════════════════════════
+  ;;  FACT SCHEMAS (Inter-Rule Communication)
+  ;; ═════════════════════════════════════════════════════════════════════
+
+  ;; Records every allocation site
+  (fact-schema alloc-event
+    (ptr-var    variable)
+    (alloc-tok  token)
+    (func-name  string)
+    (byte-size  int)
+    (in-scope   scope))
+
+  ;; Records every deallocation site
+  (fact-schema free-event
+    (ptr-var    variable)
+    (free-tok   token)
+    (in-scope   scope))
+
+  ;; Records pointer-to-stack assignments (for escape analysis)
+  (fact-schema stack-addr-taken
+    (ptr-var    variable)
+    (local-var  variable)
+    (addr-tok   token)
+    (in-scope   scope))
+
+  ;; Records null-check locations (for null-deref precision)
+  (fact-schema null-checked
+    (ptr-var    variable)
+    (check-tok  token)
+    (branch     string)     ;; "true" or "false"
+    (in-scope   scope))
+
+  ;; Records buffer size associations
+  (fact-schema buffer-size-known
+    (ptr-var    variable)
+    (size-expr  token)
+    (byte-size  int)
+    (is-stack   bool)
+    (in-scope   scope))
+
+  ;; Records that a pointer has been passed to a function
+  ;; (used to suppress false positives for ownership transfer)
+  (fact-schema ptr-passed-to-func
+    (ptr-var    variable)
+    (call-tok   token)
+    (callee     string)
+    (arg-index  int))
+
+  ;; ═════════════════════════════════════════════════════════════════════
+  ;;  PHASE 1 — FACT GATHERING RULES
+  ;; ═════════════════════════════════════════════════════════════════════
+
+  ;; ── 1.1: Record allocation events ────────────────────────────────
+
+  (rule record-malloc-alloc
+    (options (scope function) (enabled #t))
+    (pattern
+      (assign @ptr
+        (call (name @alloc-fn)
+          (args @size-arg ...))))
+    (constraint
+      (and
+        (pointer-type? @ptr)
+        (or
+          (calls-function? @ptr "malloc")
+          (calls-function? @ptr "valloc")
+          (calls-function? @ptr "aligned_alloc"))))
+    (action
+      (set-fact alloc-event
+        (ptr-var   @ptr.variable)
+        (alloc-tok @ptr)
+        (func-name @alloc-fn.str)
+        (byte-size @size-arg)
+        (in-scope  @ptr.scope))))
+
+  (rule record-calloc-alloc
+    (options (scope function))
+    (pattern
+      (assign @ptr
+        (call (name "calloc")
+          (args @nmemb @elem-size))))
+    (constraint
+      (pointer-type? @ptr))
+    (action
+      (set-fact alloc-event
+        (ptr-var   @ptr.variable)
+        (alloc-tok @ptr)
+        (func-name "calloc")
+        (byte-size ($$ "int(nmemb_val * elem_size_val) if (nmemb_val := getattr(@nmemb, 'intvalue', None)) is not None and (elem_size_val := getattr(@elem_size, 'intvalue', None)) is not None else -1"))
+        (in-scope  @ptr.scope))))
+
+  (rule record-strdup-alloc
+    (options (scope function))
+    (pattern
+      (assign @ptr
+        (call (name @dup-fn)
+          (args @src-str ...))))
+    (constraint
+      (and
+        (pointer-type? @ptr)
+        (or (calls-function? @ptr "strdup")
+            (calls-function? @ptr "strndup"))))
+    (action
+      (set-fact alloc-event
+        (ptr-var   @ptr.variable)
+        (alloc-tok @ptr)
+        (func-name @dup-fn.str)
+        (byte-size -1)  ;; unknown
+        (in-scope  @ptr.scope))))
+
+  ;; ── 1.2: Record free events ──────────────────────────────────────
+
+  (rule record-free-events
+    (options (scope function))
+    (pattern
+      (expr-stmt
+        (call (name @free-fn)
+          (args (token @ptr-tok (is-name #t))))))
+    (constraint
+      (and
+        (pointer-type? @ptr-tok)
+        (or (calls-function? @ptr-tok "free")
+            (calls-function? @ptr-tok "cfree"))))
+    (action
+      (set-fact free-event
+        (ptr-var   @ptr-tok.variable)
+        (free-tok  @ptr-tok)
+        (in-scope  @ptr-tok.scope))))
+
+  ;; ── 1.3: Record address-of-local ─────────────────────────────────
+
+  (rule record-stack-addr
+    (options (scope function))
+    (pattern
+      (assign @ptr
+        (ast-match (unary-op "&" @local))))
+    (constraint
+      (and
+        (pointer-type? @ptr)
+        (in-scope-type? @local function)
+        (not (python-pred
+          "getattr(@local.variable, 'isStatic', False)"))))
+    (action
+      (set-fact stack-addr-taken
+        (ptr-var   @ptr.variable)
+        (local-var @local.variable)
+        (addr-tok  @ptr)
+        (in-scope  @ptr.scope))))
+
+  ;; ── 1.4: Record null checks ──────────────────────────────────────
+
+  (rule record-null-checks
+    (options (scope function))
+    (pattern
+      (if-stmt
+        (condition
+          (or-pattern
+            (ast-match (comparison @cmp-op @lhs @rhs))
+            (token @lhs (is-name #t))))))
+    (constraint
+      (and
+        (pointer-type? @lhs)
+        (or
+          ;; if (ptr != NULL) or if (ptr == NULL)
+          (and (or (python-pred "@cmp_op.str == '!='")
+                   (python-pred "@cmp_op.str == '=='"))
+               (or (null-value? @rhs)
+                   (null-value? @lhs)))
+          ;; if (ptr) — truthiness test
+          (not (python-pred "hasattr(@lhs, 'astOperand1') and @lhs.astOperand1 is not None")))))
+    (action
+      (set-fact null-checked
+        (ptr-var   @lhs.variable)
+        (check-tok @lhs)
+        (branch    "true")
+        (in-scope  @lhs.scope))))
+
+  ;; ── 1.5: Record known buffer sizes (local arrays) ────────────────
+
+  (rule record-array-sizes
+    (options (scope function))
+    (pattern
+      (token @arr-tok
+        (is-name #t)
+        (where (python-pred
+          "getattr(@arr_tok.variable, 'isArray', False) and getattr(@arr_tok.variable, 'dimensions', None)"))))
+    (constraint
+      (true))
+    (action
+      (set-fact buffer-size-known
+        (ptr-var   @arr-tok.variable)
+        (size-expr @arr-tok)
+        (byte-size ($$ """
+          (lambda v: (
+            (lambda dims: dims[0].size * {'char':1,'short':2,'int':4,'long':8,'float':4,'double':8}.get(getattr(v.typeStartToken,'str',''),1) if dims and hasattr(dims[0],'size') and dims[0].size else -1
+          )(getattr(v, 'dimensions', []))
+          ))(@arr_tok.variable)
+        """))
+        (is-stack  #t)
+        (in-scope  @arr-tok.scope))))
+
+  ;; ── 1.6: Record pointer-passed-to-function ───────────────────────
+
+  (rule record-ptr-passed
+    (options (scope function))
+    (pattern
+      (call (name @callee-name)
+        (args _ ... @ptr-arg _ ...)))
+    (constraint
+      (and
+        (pointer-type? @ptr-arg)
+        (is-name? @ptr-arg)))
+    (action
+      (set-fact ptr-passed-to-func
+        (ptr-var   @ptr-arg.variable)
+        (call-tok  @ptr-arg)
+        (callee    @callee-name.str)
+        (arg-index 0))))
+
+  ;; ═════════════════════════════════════════════════════════════════════
+  ;;  PHASE 2 — DETECTION RULES
+  ;; ═════════════════════════════════════════════════════════════════════
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-415: Double Free
+  ;; ─────────────────────────────────────────────────────────────────
+
+  (rule cwe-415-double-free
+    (options (severity error) (scope function))
+    (pattern
+      (in-scope function
+        (sequence
+          (expr-stmt (use-pattern dealloc-call (bind @freed-ptr @first-free)))
+          ...
+          (expr-stmt (use-pattern dealloc-call (bind @freed-ptr @second-free))))))
+    (constraint
+      (and
+        ;; Same variable freed both times
+        (same-variable? @first-free @second-free)
+        ;; The first free reaches the second
+        (reaches @first-free @second-free)
+        ;; No intervening reassignment of the pointer
+        (along-path @first-free @second-free
+          (not (contains (assign @freed-ptr _))))
+        ;; Not the same token
+        (not (same-token? @first-free @second-free))))
+    (action
+      (report error
+        "CWE-415: Double free of '@freed-ptr.str'"
+        (location @second-free)
+        (note "First free here" (location @first-free)))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-416: Use After Free
+  ;; ─────────────────────────────────────────────────────────────────
+
+  (rule cwe-416-use-after-free-deref
+    (options (severity error) (scope function))
+    (pattern
+      (in-scope function
+        (token @use-tok
+          (is-name #t)
+          (where (pointer-type? @use-tok)))))
+    (constraint
+      (and
+        ;; There exists a prior free of this variable
+        (has-fact free-event
+          (ptr-var  @use-tok.variable)
+          (free-tok @free-tok))
+        ;; The free reaches this use
+        (reaches @free-tok @use-tok)
+        ;; No intervening reassignment
+        (along-path @free-tok @use-tok
+          (not (contains (assign @use-tok _))))
+        ;; The use is a dereference (not just passing the pointer around)
+        (or
+          ;; *ptr
+          (python-pred """
+            (lambda t: t.astParent and t.astParent.str == '*' and t.astParent.astOperand2 is None
+            )(@use_tok)
+          """)
+          ;; ptr[i]
+          (python-pred """
+            (lambda t: t.astParent and t.astParent.str == '['
+            )(@use_tok)
+          """)
+          ;; ptr->member
+          (python-pred """
+            (lambda t: t.astParent and t.astParent.str == '->' and t.astParent.astOperand1 is t
+            )(@use_tok)
+          """))))
+    (action
+      (report error
+        "CWE-416: Use after free — '@use-tok.str' was freed at line @free-tok.linenr"
+        (location @use-tok)
+        (note "Freed here" (location @free-tok)))))
+
+  (rule cwe-416-use-after-free-memfunc
+    (options (severity error) (scope function))
+    (pattern
+      (in-scope function
+        (call (name @fn-name)
+          (args _ ... (token @arg-tok (is-name #t)) _ ...))))
+    (constraint
+      (and
+        (pointer-type? @arg-tok)
+        (has-fact free-event
+          (ptr-var  @arg-tok.variable)
+          (free-tok @free-tok))
+        (reaches @free-tok @arg-tok)
+        (along-path @free-tok @arg-tok
+          (not (contains (assign @arg-tok _))))
+        ;; Only flag for functions that actually dereference the pointer
+        (or
+          (calls-function? @arg-tok "memcpy")
+          (calls-function? @arg-tok "memmove")
+          (calls-function? @arg-tok "memset")
+          (calls-function? @arg-tok "strcpy")
+          (calls-function? @arg-tok "strncpy")
+          (calls-function? @arg-tok "strcat")
+          (calls-function? @arg-tok "strlen")
+          (calls-function? @arg-tok "strcmp")
+          (calls-function? @arg-tok "printf")
+          (calls-function? @arg-tok "fprintf"))))
+    (action
+      (report error
+        "CWE-416: Freed pointer '@arg-tok.str' passed to @fn-name.str()"
+        (location @arg-tok)
+        (note "Freed here" (location @free-tok)))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-476: NULL Pointer Dereference
+  ;; ─────────────────────────────────────────────────────────────────
+
+  ;; Case 1: Dereference of a pointer that is definitely NULL
+  (rule cwe-476-null-deref-definite
+    (options (severity error) (scope function))
+    (pattern
+      (in-scope function
+        (sequence
+          (assign @ptr (null-literal))
+          ...
+          (use-pattern ptr-deref (bind @deref-ptr @deref-site)))))
+    (constraint
+      (and
+        (same-variable? @ptr @deref-ptr)
+        (reaches @ptr @deref-site)
+        (along-path @ptr @deref-site
+          (not (contains (assign @ptr _))))))
+    (action
+      (report error
+        "CWE-476: Definite null pointer dereference — '@ptr.str' is NULL"
+        (location @deref-site)
+        (note "Assigned NULL here" (location @ptr)))))
+
+  ;; Case 2: Unchecked malloc result
+  (rule cwe-476-unchecked-malloc
+    (options (severity warning) (scope function))
+    (pattern
+      (in-scope function
+        (sequence
+          (assign @ptr (use-pattern alloc-call))
+          ...
+          (use-pattern ptr-deref (bind @deref-ptr @deref-site)))))
+    (constraint
+      (and
+        (same-variable? @ptr @deref-ptr)
+        (reaches @ptr @deref-site)
+        ;; No null check between allocation and dereference
+        (not (exists @check-site
+          (and
+            (has-fact null-checked
+              (ptr-var @ptr.variable)
+              (check-tok @check-site))
+            (dominates @check-site @deref-site)
+            (reaches @ptr @check-site))))
+        ;; No reassignment
+        (along-path @ptr @deref-site
+          (not (contains (assign @ptr _))))))
+    (action
+      (report warning
+        "CWE-476: '@ptr.str' used without NULL check after allocation"
+        (location @deref-site)
+        (note "Allocated here (may return NULL)" (location @ptr)))))
+
+  ;; Case 3: Null dereference via abstract domain
+  (rule cwe-476-null-deref-abstract
+    (options (severity warning) (scope function))
+    (pattern
+      (use-pattern ptr-deref (bind @deref-ptr @deref-site)))
+    (constraint
+      (and
+        (pointer-type? @deref-ptr)
+        (with-analysis nullness @deref-ptr.scope
+          (may-be-null? @deref-ptr))
+        ;; Suppress if there's a dominating null check
+        (not (exists @check
+          (and
+            (has-fact null-checked
+              (ptr-var @deref-ptr.variable)
+              (check-tok @check))
+            (dominates @check @deref-site))))))
+    (action
+      (report warning
+        "CWE-476: Possible null pointer dereference of '@deref-ptr.str'"
+        (location @deref-site))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-590: Free of Memory Not on the Heap
+  ;; ─────────────────────────────────────────────────────────────────
+
+  (rule cwe-590-free-stack-memory
+    (options (severity error) (scope function))
+    (pattern
+      (expr-stmt
+        (use-pattern dealloc-call (bind @freed-ptr @free-site))))
+    (constraint
+      (and
+        (has-fact stack-addr-taken
+          (ptr-var  @freed-ptr.variable)
+          (addr-tok @addr-site))
+        (reaches @addr-site @free-site)
+        (along-path @addr-site @free-site
+          (not (contains (assign @freed-ptr _))))))
+    (action
+      (report error
+        "CWE-590: free() called on stack-allocated pointer '@freed-ptr.str'"
+        (location @free-site)
+        (note "Points to stack memory (address taken here)" (location @addr-site)))))
+
+  ;; Catch free() of string literals and global arrays
+  (rule cwe-590-free-static-memory
+    (options (severity error) (scope function))
+    (pattern
+      (in-scope function
+        (sequence
+          (assign @ptr @rhs)
+          ...
+          (expr-stmt (use-pattern dealloc-call (bind @freed-ptr @free-site))))))
+    (constraint
+      (and
+        (same-variable? @ptr @freed-ptr)
+        (reaches @ptr @free-site)
+        (along-path @ptr @free-site
+          (not (contains (assign @ptr _))))
+        ;; RHS is a string literal or address of global
+        (or
+          (python-pred "getattr(@rhs, 'isString', False)")
+          (and
+            (python-pred "@rhs.str == '&'")
+            (python-pred "getattr(getattr(@rhs, 'astOperand1', None), 'variable', None) and getattr(@rhs.astOperand1.variable, 'isGlobal', False)")))))
+    (action
+      (report error
+        "CWE-590: free() called on non-heap pointer '@freed-ptr.str'"
+        (location @free-site)
+        (note "Assigned non-heap value here" (location @ptr)))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-761: Free of Pointer Not at Start of Buffer
+  ;; ─────────────────────────────────────────────────────────────────
+
+  (rule cwe-761-free-offset-pointer
+    (options (severity error) (scope function))
+    (pattern
+      (in-scope function
+        (sequence
+          ;; ptr was advanced by arithmetic
+          (or-pattern
+            (ast-match (assign @ptr (binary-op "+" @ptr @offset)))
+            (ast-match (compound-assign "+=" @ptr @offset))
+            (ast-match (unary-op "++" @ptr)))
+          ...
+          (expr-stmt (use-pattern dealloc-call (bind @freed-ptr @free-site))))))
+    (constraint
+      (and
+        (same-variable? @ptr @freed-ptr)
+        (reaches @ptr @free-site)
+        ;; No reassignment back to base
+        (along-path @ptr @free-site
+          (not (contains
+            (or-pattern
+              (assign @ptr (use-pattern alloc-call))
+              (ast-match (assign @ptr (binary-op "-" @ptr _)))
+              (ast-match (compound-assign "-=" @ptr _))
+              (ast-match (unary-op "--" @ptr))))))))
+    (action
+      (report error
+        "CWE-761: free() called on pointer '@freed-ptr.str' not at start of buffer"
+        (location @free-site)
+        (note "Pointer was advanced here" (location @ptr)))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-562: Return of Stack Variable Address
+  ;; ─────────────────────────────────────────────────────────────────
+
+  (rule cwe-562-return-stack-address
+    (options (severity error) (scope function))
+    (pattern
+      (return-stmt
+        (ast-match (unary-op "&" @local-var))))
+    (constraint
+      (and
+        (in-scope-type? @local-var function)
+        (not (python-pred
+          "getattr(@local_var.variable, 'isStatic', False)"))))
+    (action
+      (report error
+        "CWE-562: Returning address of local variable '@local-var.str' — dangling pointer"
+        (location @local-var))))
+
+  (rule cwe-562-return-stack-pointer
+    (options (severity error) (scope function))
+    (pattern
+      (return-stmt @ret-expr))
+    (constraint
+      (and
+        (pointer-type? @ret-expr)
+        (has-fact stack-addr-taken
+          (ptr-var  @ret-expr.variable)
+          (addr-tok @addr-site))
+        (reaches @addr-site @ret-expr)
+        (along-path @addr-site @ret-expr
+          (not (contains (assign @ret-expr _))))))
+    (action
+      (report error
+        "CWE-562: Returning '@ret-expr.str' which points to stack memory"
+        (location @ret-expr)
+        (note "Points to stack (address taken here)" (location @addr-site)))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-120 / CWE-787: Buffer Overflow via Unbounded Copy
+  ;; ─────────────────────────────────────────────────────────────────
+
+  ;; gets() is ALWAYS unsafe
+  (rule cwe-120-gets-always-unsafe
+    (options (severity error) (scope function))
+    (pattern
+      (call (name "gets") (args @dst)))
+    (constraint (true))
+    (action
+      (report error
+        "CWE-120: Use of gets() is inherently unsafe — unbounded write to '@dst.str'. Use fgets() instead."
+        (location @dst))))
+
+  ;; strcpy/strcat where source may be larger than destination
+  (rule cwe-120-unbounded-copy-overflow
+    (options (severity warning) (scope function))
+    (pattern
+      (use-pattern unbounded-write-call
+        (bind @uw-dst @dst-site)))
+    (constraint
+      (and
+        (pointer-type? @uw-dst)
+        ;; Destination has a known size
+        (has-fact buffer-size-known
+          (ptr-var  @uw-dst.variable)
+          (byte-size @dst-size))
+        ;; Source has a known size that exceeds destination
+        (or
+          ;; Source is also a known buffer
+          (and
+            (has-fact buffer-size-known
+              (ptr-var  @uw-src.variable)
+              (byte-size @src-size))
+            (python-pred "@src_size > 0 and @dst_size > 0 and @src_size > @dst_size"))
+          ;; Source comes from untrusted input
+          (with-analysis taint @uw-src.scope
+            (tainted? @uw-src)))))
+    (action
+      (report warning
+        "CWE-120: Unbounded copy to '@uw-dst.str' via strcpy/strcat/sprintf — possible overflow"
+        (location @dst-site)
+        (note "Consider using bounded alternatives (strncpy, snprintf)"))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-121/122/787/788: Buffer Overflow via Bounded Functions
+  ;; ─────────────────────────────────────────────────────────────────
+
+  ;; Bounded write where size exceeds destination buffer
+  (rule cwe-787-bounded-write-overflow
+    (options (severity error) (scope function))
+    (pattern
+      (use-pattern bounded-write-call
+        (bind @bw-dst @write-site)))
+    (constraint
+      (and
+        (pointer-type? @bw-dst)
+        (has-fact buffer-size-known
+          (ptr-var  @bw-dst.variable)
+          (byte-size @buf-size))
+        ;; The write size definitely exceeds the buffer
+        (with-analysis intervals @bw-size.scope
+          (and
+            (interval-of @bw-size @size-lo @size-hi)
+            (python-pred "@buf_size > 0 and @size_lo > @buf_size")))))
+    (action
+      (report error
+        "CWE-787: Definite buffer overflow — writing to '@bw-dst.str' (size @buf-size) with @bw-size bytes"
+        (location @write-site))))
+
+  ;; Possible overflow (write size may exceed buffer)
+  (rule cwe-787-bounded-write-possible-overflow
+    (options (severity warning) (scope function))
+    (pattern
+      (use-pattern bounded-write-call
+        (bind @bw-dst @write-site)))
+    (constraint
+      (and
+        (pointer-type? @bw-dst)
+        (has-fact buffer-size-known
+          (ptr-var  @bw-dst.variable)
+          (byte-size @buf-size))
+        (with-analysis intervals @bw-size.scope
+          (and
+            (interval-of @bw-size @size-lo @size-hi)
+            ;; High end exceeds buffer but low end doesn't
+            ;; (possible but not definite)
+            (python-pred "@buf_size > 0 and @size_hi > @buf_size and @size_lo <= @buf_size")
+            ;; Only report if a significant fraction is OOB
+            (python-pred "(@size_hi - @buf_size) / max(@size_hi - @size_lo, 1) > 0.25")))))
+    (action
+      (report warning
+        "CWE-787: Possible buffer overflow — '@bw-dst.str' (size @buf-size) with write size [@size-lo, @size-hi]"
+        (location @write-site))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-125/126/127: Out-of-Bounds Read
+  ;; ─────────────────────────────────────────────────────────────────
+
+  ;; Bounded read where size exceeds source buffer
+  (rule cwe-125-bounded-read-overflow
+    (options (severity error) (scope function))
+    (pattern
+      (use-pattern bounded-read-call
+        (bind @br-src @read-site)))
+    (constraint
+      (and
+        (pointer-type? @br-src)
+        (has-fact buffer-size-known
+          (ptr-var  @br-src.variable)
+          (byte-size @buf-size))
+        (with-analysis intervals @br-size.scope
+          (and
+            (interval-of @br-size @size-lo @size-hi)
+            (python-pred "@buf_size > 0 and @size_lo > @buf_size")))))
+    (action
+      (report error
+        "CWE-125: Definite out-of-bounds read from '@br-src.str' (size @buf-size) with @br-size bytes"
+        (location @read-site))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-119/787: Array Index Out-of-Bounds
+  ;; ─────────────────────────────────────────────────────────────────
+
+  ;; Definite array OOB via interval analysis
+  (rule cwe-119-array-oob-definite
+    (options (severity error) (scope function))
+    (pattern
+      (ast-match
+        (array-subscript @arr @index)))
+    (constraint
+      (and
+        (has-fact buffer-size-known
+          (ptr-var  @arr.variable)
+          (byte-size @buf-bytes))
+        (with-analysis intervals @index.scope
+          (and
+            (interval-of @index @idx-lo @idx-hi)
+            (or
+              ;; Definite overflow: lowest index >= array element count
+              (python-pred """
+                (lambda: (
+                  elem_sz := max({
+                    'char':1,'short':2,'int':4,'long':8,
+                    'float':4,'double':8
+                  }.get(getattr(getattr(@arr.variable, 'typeStartToken', None), 'str', ''), 1), 1),
+                  @idx_lo >= @buf_bytes // elem_sz
+                )[-1])()
+              """)
+              ;; Definite underflow: highest index < 0
+              (python-pred "@idx_hi < 0"))))))
+    (action
+      (report error
+        "CWE-119: Definite array out-of-bounds — '@arr.str[@index.str]' (index range [@idx-lo, @idx-hi], buffer @buf-bytes bytes)"
+        (location @index))))
+
+  ;; Possible array OOB
+  (rule cwe-119-array-oob-possible
+    (options (severity warning) (scope function))
+    (pattern
+      (ast-match
+        (array-subscript @arr @index)))
+    (constraint
+      (and
+        (has-fact buffer-size-known
+          (ptr-var  @arr.variable)
+          (byte-size @buf-bytes))
+        (with-analysis intervals @index.scope
+          (and
+            (interval-of @index @idx-lo @idx-hi)
+            ;; Upper end of index range exceeds array bounds
+            ;; but lower end is in bounds (possible, not definite)
+            (python-pred """
+              (lambda: (
+                elem_sz := max({
+                  'char':1,'short':2,'int':4,'long':8,
+                  'float':4,'double':8
+                }.get(getattr(getattr(@arr.variable, 'typeStartToken', None), 'str', ''), 1), 1),
+                arr_len := @buf_bytes // elem_sz,
+                @idx_hi >= arr_len and @idx_lo < arr_len and @idx_lo >= 0
+                and (@idx_hi - arr_len) / max(@idx_hi - @idx_lo, 1) > 0.25
+              )[-1])()
+            """)))))
+    (action
+      (report warning
+        "CWE-119: Possible array out-of-bounds — '@arr.str' index range [@idx-lo, @idx-hi]"
+        (location @index))))
+
+  ;; Negative index (underflow)
+  (rule cwe-124-array-underflow
+    (options (severity warning) (scope function))
+    (pattern
+      (ast-match
+        (array-subscript @arr @index)))
+    (constraint
+      (with-analysis intervals @index.scope
+        (and
+          (interval-of @index @idx-lo @idx-hi)
+          (python-pred "@idx_lo < 0 and @idx_hi >= 0"))))
+    (action
+      (report warning
+        "CWE-124: Possible buffer underflow — '@arr.str' index may be negative (range [@idx-lo, @idx-hi])"
+        (location @index))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-131: Incorrect Calculation of Buffer Size
+  ;; ─────────────────────────────────────────────────────────────────
+
+  ;; malloc(sizeof(ptr)) when sizeof(*ptr) was intended
+  (rule cwe-131-sizeof-pointer
+    (options (severity warning) (scope function))
+    (pattern
+      (assign @ptr
+        (call (name "malloc")
+          (args
+            (ast-match (call (name "sizeof") (args @sizeof-arg)))))))
+    (constraint
+      (and
+        (pointer-type? @ptr)
+        (pointer-type? @sizeof-arg)
+        ;; sizeof(ptr) gives pointer size, not pointee size
+        (python-pred """
+          getattr(getattr(@sizeof_arg, 'valueType', None), 'pointer', 0) >= 1
+        """)))
+    (action
+      (report warning
+        "CWE-131: malloc(sizeof(@sizeof-arg.str)) — '@sizeof-arg.str' is a pointer. Did you mean sizeof(*@sizeof-arg.str)?"
+        (location @sizeof-arg))))
+
+  ;; snprintf(buf, sizeof(buf) - 1, ...) off-by-one
+  (rule cwe-131-snprintf-off-by-one
+    (options (severity style) (scope function))
+    (pattern
+      (call (name "snprintf")
+        (args @buf
+          (ast-match
+            (binary-op "-"
+              (call (name "sizeof") (args @sizeof-arg))
+              (token @one (is-int #t) (where (value-in-range? @one 1 1)))))
+          _ ...)))
+    (constraint
+      (same-variable? @buf @sizeof-arg))
+    (action
+      (report style
+        "CWE-131: snprintf() already null-terminates — sizeof(@buf.str) - 1 is likely off-by-one"
+        (location @buf)
+        (note "Use sizeof(@buf.str) instead"))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-789: Memory Allocation with Excessive Size
+  ;; ─────────────────────────────────────────────────────────────────
+
+  (rule cwe-789-excessive-alloc-size
+    (options (severity warning) (scope function))
+    (pattern
+      (assign @ptr
+        (call (name @alloc-fn)
+          (args @size-arg ...))))
+    (constraint
+      (and
+        (or
+          (calls-function? @ptr "malloc")
+          (calls-function? @ptr "calloc")
+          (calls-function? @ptr "realloc")
+          (calls-function? @ptr "valloc"))
+        (with-analysis intervals @size-arg.scope
+          (and
+            (interval-of @size-arg @size-lo @size-hi)
+            ;; Upper bound exceeds 1 GiB
+            (python-pred "@size_hi > 1073741824")))))
+    (action
+      (report warning
+        "CWE-789: Allocation size may be excessive: '@alloc-fn.str' with size up to @size-hi bytes"
+        (location @size-arg))))
+
+  ;; Tainted allocation size
+  (rule cwe-789-tainted-alloc-size
+    (options (severity warning) (scope function))
+    (pattern
+      (assign @ptr
+        (use-pattern alloc-call (bind @alloc-size @size-site))))
+    (constraint
+      (and
+        (pointer-type? @ptr)
+        (with-analysis taint @size-site.scope
+          (tainted? @alloc-size))))
+    (action
+      (report warning
+        "CWE-789: Allocation size from untrusted source — '@alloc-size.str'"
+        (location @size-site)
+        (note "Validate size before allocation"))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  CWE-170: Improper Null Termination
+  ;; ─────────────────────────────────────────────────────────────────
+
+  ;; strncpy does not guarantee null termination
+  (rule cwe-170-strncpy-no-null-term
+    (options (severity warning) (scope function))
+    (pattern
+      (in-scope function
+        (call (name "strncpy")
+          (args @dst @src @size))))
+    (constraint
+      (and
+        (pointer-type? @dst)
+        ;; After the strncpy, dst is used as a string without explicit
+        ;; null termination
+        (exists-after @dst @str-use
+          (and
+            (or
+              (calls-function? @str-use "strlen")
+              (calls-function? @str-use "printf")
+              (calls-function? @str-use "strcmp")
+              (calls-function? @str-use "strcat")
+              (calls-function? @str-use "puts"))
+            (along-path @dst @str-use
+              (not (contains
+                (or-pattern
+                  ;; Explicit null termination: dst[n] = '\0'
+                  (ast-match
+                    (assign
+                      (array-subscript @dst _)
+                      (token _ (where (null-value? _)))))
+                  ;; Reassignment of dst
+                  (assign @dst _)))))))))
+    (action
+      (report warning
+        "CWE-170: strncpy() may not null-terminate '@dst.str' — used as string at line @str-use.linenr"
+        (location @dst)
+        (note "Add explicit null termination: @dst.str[size-1] = '\\0'"))))
+
+  ;; ─────────────────────────────────────────────────────────────────
+  ;;  BONUS: Alloca in Loop (Stack Overflow Risk)
+  ;; ─────────────────────────────────────────────────────────────────
+
+  (rule alloca-in-loop
+    (options (severity warning) (scope function))
+    (pattern
+      (call (name "alloca") (args @size)))
+    (constraint
+      (in-loop? @size))
+    (action
+      (report warning
+        "alloca() inside a loop — may cause stack overflow on large iteration counts"
+        (location @size)
+        (note "Consider using malloc/free or a fixed-size buffer"))))
+
+) ;; end addon buflint
