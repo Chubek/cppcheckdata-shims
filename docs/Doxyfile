@@ -1,0 +1,113 @@
+# =============================================================================
+#  docs/Doxyfile — Doxygen configuration for cppcheckdata-shims
+#
+#  Doxygen is used here primarily for:
+#    - Call graphs and caller graphs
+#    - Dependency diagrams
+#    - Cross-reference with C/C++ (cppcheckdata.py interfaces)
+#
+#  The primary documentation is built by Sphinx (conf.py).
+#  Doxygen output can be integrated via the Breathe extension.
+# =============================================================================
+
+# -- Project ------------------------------------------------------------------
+PROJECT_NAME           = "cppcheckdata-shims"
+PROJECT_NUMBER         = "0.1.0"
+PROJECT_BRIEF          = "Static-analysis shims and CASL DSL for Cppcheck"
+PROJECT_LOGO           =
+
+OUTPUT_DIRECTORY       = doxygen
+CREATE_SUBDIRS         = YES
+ALLOW_UNICODE_NAMES    = YES
+
+# -- Input --------------------------------------------------------------------
+INPUT                  = ../cppcheckdata_shims \
+                         ../casl
+INPUT_ENCODING         = UTF-8
+FILE_PATTERNS          = *.py
+RECURSIVE              = YES
+EXCLUDE_PATTERNS       = */tests/* \
+                         */__pycache__/* \
+                         */.*
+
+# -- Python-specific ----------------------------------------------------------
+#  Doxygen's Python support is limited; we use OPTIMIZE_OUTPUT_JAVA
+#  which gives better results for Python than the default C++ mode.
+OPTIMIZE_OUTPUT_JAVA   = YES
+EXTENSION_MAPPING      = py=Python
+
+# -- Extraction ---------------------------------------------------------------
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+
+# -- Docstring filtering ------------------------------------------------------
+#  Use doxygen's Python docstring parser
+PYTHON_DOCSTRING       = YES
+#  Filter: strip triple-quoted docstrings into Doxygen comments
+#  (Doxygen handles this natively for Python files)
+
+# -- Source browsing -----------------------------------------------------------
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = YES
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+# -- Graphs -------------------------------------------------------------------
+HAVE_DOT               = YES
+DOT_NUM_THREADS        = 0
+CALL_GRAPH             = YES
+CALLER_GRAPH           = YES
+GRAPHICAL_HIERARCHY    = YES
+DIRECTORY_GRAPH        = YES
+CLASS_GRAPH            = YES
+COLLABORATION_GRAPH    = YES
+INCLUDE_GRAPH          = YES
+INCLUDED_BY_GRAPH      = YES
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
+DOT_GRAPH_MAX_NODES    = 100
+MAX_DOT_GRAPH_DEPTH    = 5
+
+# -- Output formats -----------------------------------------------------------
+#  HTML output (standalone browsing)
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_DYNAMIC_SECTIONS  = YES
+HTML_COLORSTYLE        = LIGHT
+
+#  XML output (consumed by Breathe for Sphinx integration)
+GENERATE_XML           = YES
+XML_OUTPUT             = xml
+XML_PROGRAMLISTING     = YES
+
+#  LaTeX output
+GENERATE_LATEX         = YES
+LATEX_OUTPUT           = latex
+LATEX_ENGINE           = xelatex
+LATEX_CMD_NAME         = latexmk
+COMPACT_LATEX          = YES
+PDF_HYPERLINKS         = YES
+USE_PDFLATEX           = NO
+
+#  Man page output
+GENERATE_MAN           = NO
+
+#  RTF output
+GENERATE_RTF           = NO
+
+# -- Warnings -----------------------------------------------------------------
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_AS_ERROR          = NO
+WARN_LOGFILE           = doxygen/warnings.log
+
+# -- Preprocessing -------------------------------------------------------------
+ENABLE_PREPROCESSING   = YES
+SEARCH_INCLUDES        = YES
+
+# -- Alphabetical index -------------------------------------------------------
+ALPHABETICAL_INDEX     = YES
