@@ -18,4 +18,11 @@
 - ماژول `symbolic_exe.py‍‍`‌:‌ اجرای نمادین
 - ماژول `qscore.py‍`: امتیاز به کیفیت برنامه
 - ماژول `type_analysis.py‍`: تحلیل تایپ‌ها
+- ماژول ‍‍`checkers.py`: اینترفیس کتاب‌خانه، چارچوب هم‌بستگی ماژول‌ها
+
+وابستگی این ماژ‌ول‌ها به یک‌دیگر، از پایین به بالاست.
+
+```text
+cppcheckdata  ←  ctrlflow_graph  ←  dataflow_engine  ←  abstract_interp  ←  checkers
+```
 
