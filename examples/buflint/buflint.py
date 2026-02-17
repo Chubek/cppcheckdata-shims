@@ -1,2387 +1,1159 @@
 #!/usr/bin/env python3
 """
-Buflint.py — A Sound Static Analyzer for Memory Safety
-═══════════════════════════════════════════════════════
+buflint.py  —  Cppcheck addon for buffer & memory-safety CWEs.
 
-A Cppcheck addon that detects memory-safety violations using the
-cppcheckdata-shims library's abstract interpretation, dataflow analysis,
-and symbolic execution infrastructure.
+Detected CWEs
+──────────────
+  CWE-120  Classic buffer overflow (gets / scanf %s)
+  CWE-121  Stack-based buffer overflow
+  CWE-122  Heap-based buffer overflow
+  CWE-124  Buffer underwrite
+  CWE-126  Buffer over-read
+  CWE-127  Buffer under-read (negative index read)
+  CWE-131  Incorrect calculation of buffer size
+  CWE-135  Incorrect calculation of multi-byte string length
+  CWE-170  Improper null termination
+  CWE-401  Missing release of memory after effective lifetime (leak)
+  CWE-415  Double free
+  CWE-416  Use after free
+  CWE-476  NULL pointer dereference
+  CWE-590  Free of memory not on the heap
+  CWE-761  Free of pointer not at start of buffer
+  CWE-787  Out-of-bounds write
+  CWE-805  Buffer access with incorrect length value
 
-Targeted CWEs:
-    CWE-119  Buffer Overflow (read/write)
-    CWE-120  Buffer Copy without Checking Size of Input
-    CWE-121  Stack-based Buffer Overflow
-    CWE-122  Heap-based Buffer Overflow
-    CWE-124  Buffer Underwrite
-    CWE-125  Out-of-bounds Read
-    CWE-126  Buffer Over-read
-    CWE-127  Buffer Under-read
-    CWE-131  Incorrect Calculation of Buffer Size
-    CWE-170  Improper Null Termination
-    CWE-190  Integer Overflow to Buffer Overflow
-    CWE-415  Double Free
-    CWE-416  Use After Free
-    CWE-476  NULL Pointer Dereference
-    CWE-590  Free of Memory not on the Heap
-    CWE-761  Free of Pointer not at Start of Buffer
-    CWE-787  Out-of-bounds Write
-    CWE-788  Access of Memory Location After End of Buffer
-    CWE-789  Memory Allocation with Excessive Size Value
+Architecture  (four passes, token-list + AST only, NO CFG import)
+──────────────
+  Pass 1 — MemSafetyAnalysis   : forward token-walk typestate tracking
+  Pass 2 — PatternChecks        : syntactic pattern detection
+  Pass 3 — BoundsAnalysis       : buffer-size / index checking
+  Pass 4 — NullCheckAnalysis    : missing NULL check after malloc
 
-Design Principles:
-    1. SOUNDNESS: Every real bug in the checked categories is reported
-       (no false negatives). Achieved via over-approximating abstract
-       domains and conservative transfer functions.
-    2. LOW FALSE POSITIVES: Precision is maximized through:
-       - Flow-sensitive interval analysis with threshold widening
-       - Path-sensitive nullness/allocation-state tracking
-       - Interprocedural summaries for common library functions
-       - Reduced product domain combining intervals, allocation state,
-         and nullness for mutual refinement
-    3. MODULARITY: Each CWE check is a separate checker class registered
-       with the checker framework; users can enable/disable individually.
-
-Architecture:
-    ┌──────────────────────────────────────────────────┐
-    │              Buflint (this file)                  │
-    │  ┌────────────────────────────────────────────┐  │
-    │  │  MemorySafetyChecker (orchestrator)        │  │
-    │  │    ├── BufferOverflowChecker               │  │
-    │  │    ├── UseAfterFreeChecker                 │  │
-    │  │    ├── DoubleFreeChecker                   │  │
-    │  │    ├── NullDerefChecker                    │  │
-    │  │    ├── UninitializedReadChecker            │  │
-    │  │    └── AllocationMisuseChecker             │  │
-    │  └────────────────────────────────────────────┘  │
-    │  ┌────────────────────────────────────────────┐  │
-    │  │  MemoryAbstractDomain (reduced product)    │  │
-    │  │    = IntervalDomain                        │  │
-    │  │    × AllocationStateDomain                 │  │
-    │  │    × NullnessDomain                        │  │
-    │  │    × BufferSizeDomain                      │  │
-    │  │    with reduction operator                 │  │
-    │  └────────────────────────────────────────────┘  │
-    │  ┌────────────────────────────────────────────┐  │
-    │  │  MemorySafetyAnalysis (forward dataflow)   │  │
-    │  │    uses CFG + DataflowEngine               │  │
-    │  │    with widening + narrowing               │  │
-    │  └────────────────────────────────────────────┘  │
-    └──────────────────────────────────────────────────┘
-
-Usage:
+Usage
+─────
     cppcheck --dump myfile.c
-    python Buflint.py myfile.c.dump
+    python buflint.py myfile.c.dump
 
-    Or with specific checkers:
-    python Buflint.py --enable=buffer,uaf,double-free myfile.c.dump
-
-License: MIT
+Or integrated:
+    cppcheck --addon=buflint.py myfile.c
 """
 
 from __future__ import annotations
 
-import argparse
-import math
 import sys
-from abc import ABC, abstractmethod
-from collections import defaultdict
+import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import (
     Any,
-    Callable,
     Dict,
-    FrozenSet,
     List,
-    Mapping,
     Optional,
-    Sequence,
     Set,
     Tuple,
-    Union,
 )
 
 import cppcheckdata
 
-from cppcheckdata_shims.abstract_domains import (
-    BOTTOM,
-    TOP,
-    AbstractDomain,
-    ConstantDomain,
-    FlatDomain,
-    FunctionDomain,
-    IntervalDomain,
-    ProductDomain,
-    ReducedProductDomain,
-    SetDomain,
-)
-from cppcheckdata_shims.ctrlflow_graph import (
-    BasicBlock,
-    CFG,
-    CFGBuilder,
-    EdgeKind,
-)
-from cppcheckdata_shims.ctrlflow_analysis import (
-    compute_dominators,
-    compute_post_dominators,
-    is_reachable,
-)
-from cppcheckdata_shims.dataflow_analysis import (
-    ForwardAnalysis,
-    BackwardAnalysis,
-    DataflowResult,
-    LiveVariables,
-)
-from cppcheckdata_shims.dataflow_engine import (
-    DataflowEngine,
-    WorklistStrategy,
-)
-from cppcheckdata_shims.abstract_interp import (
-    AbstractInterpreter,
-    AbstractState,
-    PathSensitiveInterpreter,
-)
-from cppcheckdata_shims.callgraph import CallGraphBuilder, CallGraph
-from cppcheckdata_shims.interproc_analysis import (
-    InterproceduralAnalysis,
-    ContextPolicy,
-    BottomUpAnalyzer,
-)
-from cppcheckdata_shims.memory_abstraction import (
-    PointsToAnalysis,
-    AliasAnalysis,
-    AbstractHeap,
-    AllocationSite,
-    MemoryLocation,
-)
-from cppcheckdata_shims.type_analysis import TypeAnalyzer
-from cppcheckdata_shims.constraint_engine import (
-    ConstraintSolver,
-    Constraint,
-)
-from cppcheckdata_shims.checkers import (
-    Checker,
-    CheckerRegistry,
-    Severity,
-    Finding,
-    CheckerContext,
-)
-from cppcheckdata_shims.qscore import QualityScorer
+# ═══════════════════════════════════════════════════════════════════
+#  OPTIONAL: IntervalDomain from cppcheckdata_shims
+# ═══════════════════════════════════════════════════════════════════
+
+try:
+    from cppcheckdata_shims.abstract_domains import IntervalDomain
+    _HAS_INTERVAL = True
+except ImportError:
+    _HAS_INTERVAL = False
+
+if not _HAS_INTERVAL:
+    _INF = float("inf")
+
+    class IntervalDomain:
+        """Minimal [lo, hi] integer interval (fallback)."""
+
+        def __init__(self, lo: float = _INF, hi: float = -_INF):
+            self.lo = lo
+            self.hi = hi
+
+        @classmethod
+        def const(cls, v: int) -> "IntervalDomain":
+            return cls(float(v), float(v))
+
+        @classmethod
+        def range(cls, lo: int, hi: int) -> "IntervalDomain":
+            return cls(float(lo), float(hi))
+
+        def is_bottom(self) -> bool:
+            return self.lo > self.hi
+
+        def contains(self, v: int) -> bool:
+            if self.is_bottom():
+                return False
+            return self.lo <= v <= self.hi
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PART 0 — CONSTANTS AND CWE DEFINITIONS
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  REPORTING
+# ═══════════════════════════════════════════════════════════════════
 
-class CWE(Enum):
-    """Memory-safety CWEs checked by Buflint."""
-    CWE_119 = (
-        119, "Improper Restriction of Operations within the Bounds of a Memory Buffer")
-    CWE_120 = (120, "Buffer Copy without Checking Size of Input")
-    CWE_121 = (121, "Stack-based Buffer Overflow")
-    CWE_122 = (122, "Heap-based Buffer Overflow")
-    CWE_124 = (124, "Buffer Underwrite ('Buffer Underflow')")
-    CWE_125 = (125, "Out-of-bounds Read")
-    CWE_126 = (126, "Buffer Over-read")
-    CWE_127 = (127, "Buffer Under-read")
-    CWE_131 = (131, "Incorrect Calculation of Buffer Size")
-    CWE_170 = (170, "Improper Null Termination")
-    CWE_190 = (190, "Integer Overflow or Wraparound")
-    CWE_415 = (415, "Double Free")
-    CWE_416 = (416, "Use After Free")
-    CWE_476 = (476, "NULL Pointer Dereference")
-    CWE_590 = (590, "Free of Memory not on the Heap")
-    CWE_761 = (761, "Free of Pointer not at Start of Buffer")
-    CWE_787 = (787, "Out-of-bounds Write")
-    CWE_788 = (788, "Access of Memory Location After End of Buffer")
-    CWE_789 = (789, "Memory Allocation with Excessive Size Value")
+@dataclass
+class Finding:
+    file: str
+    line: int
+    column: int
+    severity: str
+    message: str
+    cwe: int
+    check_id: str
 
-    def __init__(self, number: int, description: str):
-        self.number = number
-        self.description = description
-
-    def tag(self) -> str:
-        return f"CWE-{self.number}"
+    def format_cli(self) -> str:
+        return (
+            f"[{self.file}:{self.line}:{self.column}] "
+            f"({self.severity}) "
+            f"buflint/{self.check_id}: {self.message} "
+            f"[CWE-{self.cwe}]"
+        )
 
 
-# Size thresholds for "excessive allocation" (CWE-789)
-_MAX_REASONABLE_ALLOC = 1 << 30  # 1 GiB
+class Reporter:
+    def __init__(self) -> None:
+        self.findings: List[Finding] = []
+        self._seen: Set[Tuple[str, int, int, str]] = set()
 
-# Common buffer-manipulation functions and their signatures
-# (func_name -> (dst_param_idx, src_param_idx, size_param_idx, is_write))
-_BUFFER_FUNCS: Dict[str, Tuple[int, Optional[int], Optional[int], bool]] = {
-    "memcpy":   (0, 1, 2, True),
-    "memmove":  (0, 1, 2, True),
-    "memset":   (0, None, 2, True),
-    "strncpy":  (0, 1, 2, True),
-    "strncat":  (0, 1, 2, True),
-    "snprintf": (0, None, 1, True),
-    "memcmp":   (0, 1, 2, False),
-    "strncmp":  (0, 1, 2, False),
-    "fread":    (0, None, None, True),
-    "fwrite":   (0, None, None, False),
-    "read":     (1, None, 2, True),
-    "write":    (1, None, 2, False),
-    "recv":     (1, None, 2, True),
-    "send":     (1, None, 2, False),
-}
+    def report(self, token: Any, severity: str, message: str,
+               cwe: int, check_id: str) -> None:
+        f_file = getattr(token, "file", "<unknown>")
+        f_line = int(getattr(token, "linenr", 0))
+        f_col  = int(getattr(token, "column", 0))
 
-# Functions that copy without explicit size (dangerous)
-_UNBOUNDED_COPY_FUNCS: Set[str] = {
-    "strcpy", "strcat", "sprintf", "gets", "scanf",
-}
+        key = (f_file, f_line, cwe, check_id)
+        if key in self._seen:
+            return
+        self._seen.add(key)
 
-# Allocation functions: name -> size_param_index
-_ALLOC_FUNCS: Dict[str, Optional[int]] = {
-    "malloc": 0,
-    "calloc": None,   # special: arg0 * arg1
-    "realloc": 1,
-    "aligned_alloc": 1,
-    "valloc": 0,
-    "pvalloc": 0,
-    "memalign": 1,
-    "posix_memalign": 2,
-    "strdup": None,    # size = strlen(arg) + 1
-    "strndup": 1,
-}
+        self.findings.append(Finding(
+            file=f_file, line=f_line, column=f_col,
+            severity=severity, message=message,
+            cwe=cwe, check_id=check_id,
+        ))
 
-# Deallocation functions: name -> pointer_param_index
-_FREE_FUNCS: Dict[str, int] = {
-    "free": 0,
-    "cfree": 0,
-}
+    def dump(self) -> None:
+        for f in sorted(self.findings, key=lambda x: (x.file, x.line, x.column)):
+            print(f.format_cli())
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PART 1 — ABSTRACT DOMAINS FOR MEMORY SAFETY
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  HELPER UTILITIES
+# ═══════════════════════════════════════════════════════════════════
 
-# ---------------------------------------------------------------------------
-#  1a. Allocation State Domain
-# ---------------------------------------------------------------------------
-#
-#  Tracks the lifecycle of a heap-allocated memory region:
-#
-#              ⊤ (unknown)
-#           /  |   \
-#     Allocated  Freed  StackLocal
-#           \  |   /
-#              ⊥ (unreachable)
-#
-#  This is a flat lattice of height 2; no widening needed.
+def _s(tok: Any) -> str:
+    """Safe token string."""
+    if tok is None:
+        return ""
+    return getattr(tok, "str", "") or ""
+
+
+def _var_id(tok: Any) -> int:
+    """Variable ID or 0."""
+    if tok is None:
+        return 0
+    vid = getattr(tok, "varId", 0)
+    return vid if vid else 0
+
+
+def _is_alloc(tok: Any) -> bool:
+    """Is token an allocation function name (immediately before '(')?"""
+    return _s(tok) in ("malloc", "calloc", "realloc", "strdup",
+                        "strndup", "aligned_alloc")
+
+
+def _is_free(tok: Any) -> bool:
+    return _s(tok) == "free"
+
+
+def _try_eval(tok: Any) -> Optional[int]:
+    """Evaluate a constant expression in the AST.  Returns None on failure."""
+    if tok is None:
+        return None
+
+    s = _s(tok)
+
+    # Integer literal
+    if getattr(tok, "isNumber", False):
+        try:
+            if s.startswith(("0x", "0X")):
+                return int(s, 16)
+            if s.startswith("0") and len(s) > 1 and s.isdigit():
+                return int(s, 8)
+            return int(s)
+        except (ValueError, OverflowError):
+            return None
+
+    # Check value-flow for known values (most reliable)
+    values = getattr(tok, "values", None) or []
+    for v in values:
+        if getattr(v, "valueKind", "") == "known":
+            iv = getattr(v, "intvalue", None)
+            if iv is not None:
+                return int(iv)
+
+    # sizeof — Cppcheck resolves sizeof into values
+    if s == "sizeof":
+        for v in values:
+            iv = getattr(v, "intvalue", None)
+            if iv is not None:
+                return int(iv)
+        return None
+
+    # Binary operators
+    op1 = getattr(tok, "astOperand1", None)
+    op2 = getattr(tok, "astOperand2", None)
+
+    if s == "*" and op1 and op2:
+        a, b = _try_eval(op1), _try_eval(op2)
+        if a is not None and b is not None:
+            return a * b
+    if s == "+" and op1 and op2:
+        a, b = _try_eval(op1), _try_eval(op2)
+        if a is not None and b is not None:
+            return a + b
+    if s == "-" and op1 and op2:
+        a, b = _try_eval(op1), _try_eval(op2)
+        if a is not None and b is not None:
+            return a - b
+    if s == "/" and op1 and op2:
+        a, b = _try_eval(op1), _try_eval(op2)
+        if a is not None and b is not None and b != 0:
+            return a // b
+    if s == "<<" and op1 and op2:
+        a, b = _try_eval(op1), _try_eval(op2)
+        if a is not None and b is not None:
+            return a << b
+
+    # Fallback: first known value
+    for v in values:
+        iv = getattr(v, "intvalue", None)
+        if iv is not None:
+            return int(iv)
+
+    return None
+
+
+def _get_func_name_from_call(call_paren_tok: Any) -> str:
+    """
+    Given the '(' token of a function call, return the function name.
+    In cppcheckdata AST:  '(' has astOperand1 = function-name,
+                                   astOperand2 = first-arg (or comma tree).
+    """
+    op1 = getattr(call_paren_tok, "astOperand1", None)
+    if op1:
+        return _s(op1)
+    prev = getattr(call_paren_tok, "previous", None)
+    if prev and getattr(prev, "isName", False):
+        return _s(prev)
+    return ""
+
+
+def _get_call_args_from_paren(paren_tok: Any) -> List[Any]:
+    """
+    Given the '(' token, collect AST argument nodes.
+    astOperand2 of '(' is the arg tree.  If it's a ',' node, flatten it.
+    """
+    result: List[Any] = []
+    root = getattr(paren_tok, "astOperand2", None)
+    if root is None:
+        return result
+    _flatten_comma(root, result)
+    return result
+
+
+def _flatten_comma(tok: Any, out: List[Any]) -> None:
+    if tok is None:
+        return
+    if _s(tok) == ",":
+        _flatten_comma(getattr(tok, "astOperand1", None), out)
+        _flatten_comma(getattr(tok, "astOperand2", None), out)
+    else:
+        out.append(tok)
+
+
+def _get_alloc_size(func_name_tok: Any) -> Optional[int]:
+    """
+    For malloc(N) or calloc(N,M), compute the allocation size.
+    func_name_tok is the name token (e.g. 'malloc'), next should be '('.
+    """
+    name = _s(func_name_tok)
+    nxt = getattr(func_name_tok, "next", None)
+    if nxt is None or _s(nxt) != "(":
+        return None
+
+    args = _get_call_args_from_paren(nxt)
+
+    if name == "malloc" and len(args) >= 1:
+        return _try_eval(args[0])
+    if name == "calloc" and len(args) >= 2:
+        a = _try_eval(args[0])
+        b = _try_eval(args[1])
+        if a is not None and b is not None:
+            return a * b
+    return None
+
+
+def _get_array_dimension(var: Any) -> Optional[int]:
+    """
+    Get the first dimension of an array variable from its declaration.
+    Uses the variable's nameToken and walks the declaration tokens.
+    """
+    if var is None:
+        return None
+    if not getattr(var, "isArray", False):
+        return None
+
+    name_tok = getattr(var, "nameToken", None)
+    if name_tok is None:
+        return None
+
+    # Walk from nameToken looking for [ N ]
+    t = name_tok.next
+    if t and _s(t) == "[":
+        # Try AST of the bracket expression
+        # In the AST, the '[' in declaration context may have the
+        # dimension as astOperand2
+        dim = getattr(t, "astOperand2", None)
+        if dim:
+            v = _try_eval(dim)
+            if v is not None:
+                return v
+
+        # Fallback: look at the token between [ and ]
+        link = getattr(t, "link", None)
+        if link:
+            inner = t.next
+            if inner and inner != link:
+                v = _try_eval(inner)
+                if v is not None:
+                    return v
+    return None
+
+
+def _get_element_size_from_var(var: Any) -> int:
+    """Get element size from variable type.  Default 1."""
+    if var is None:
+        return 1
+    name_tok = getattr(var, "nameToken", None)
+    tok_to_check = name_tok if name_tok else None
+    if tok_to_check is None:
+        return 1
+
+    vt = getattr(tok_to_check, "valueType", None)
+    if vt is None:
+        return 1
+
+    type_name = getattr(vt, "type", "")
+    size_map = {
+        "char": 1, "short": 2, "int": 4, "long": 8,
+        "float": 4, "double": 8,
+    }
+    return size_map.get(type_name, 1)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  POINTER STATE FOR PASS 1
+# ═══════════════════════════════════════════════════════════════════
 
 class AllocState(Enum):
-    """Lifecycle state of a memory object."""
-    BOTTOM = auto()       # unreachable / no information
-    UNALLOCATED = auto()  # not yet allocated (e.g., declared pointer)
-    ALLOCATED = auto()    # heap-allocated and valid
-    FREED = auto()        # heap-allocated but freed
-    STACK_LOCAL = auto()  # points to stack-local storage
-    STATIC = auto()       # points to static/global storage
-    TOP = auto()          # unknown state
+    UNKNOWN     = auto()
+    ALLOCATED   = auto()
+    FREED       = auto()
+    NULL        = auto()
+    NON_HEAP    = auto()
 
-
-# Join table for AllocState (flat lattice: any two distinct non-⊥ → ⊤)
-_ALLOC_JOIN: Dict[AllocState, Dict[AllocState, AllocState]] = {
-    AllocState.BOTTOM: {s: s for s in AllocState},
-    AllocState.TOP: {s: AllocState.TOP for s in AllocState},
-}
-for s in AllocState:
-    if s not in (AllocState.BOTTOM, AllocState.TOP):
-        _ALLOC_JOIN[s] = {}
-        for t in AllocState:
-            if t is AllocState.BOTTOM:
-                _ALLOC_JOIN[s][t] = s
-            elif t is AllocState.TOP:
-                _ALLOC_JOIN[s][t] = AllocState.TOP
-            elif s == t:
-                _ALLOC_JOIN[s][t] = s
-            else:
-                _ALLOC_JOIN[s][t] = AllocState.TOP
-
-# Meet table (dual)
-_ALLOC_MEET: Dict[AllocState, Dict[AllocState, AllocState]] = {
-    AllocState.TOP: {s: s for s in AllocState},
-    AllocState.BOTTOM: {s: AllocState.BOTTOM for s in AllocState},
-}
-for s in AllocState:
-    if s not in (AllocState.BOTTOM, AllocState.TOP):
-        _ALLOC_MEET[s] = {}
-        for t in AllocState:
-            if t is AllocState.TOP:
-                _ALLOC_MEET[s][t] = s
-            elif t is AllocState.BOTTOM:
-                _ALLOC_MEET[s][t] = AllocState.BOTTOM
-            elif s == t:
-                _ALLOC_MEET[s][t] = s
-            else:
-                _ALLOC_MEET[s][t] = AllocState.BOTTOM
-
-
-@dataclass(frozen=True, slots=True)
-class AllocStateDomain:
-    """
-    Abstract domain tracking allocation state of a pointer.
-    Flat lattice — height 2, no widening needed.
-    """
-    state: AllocState
-
-    @classmethod
-    def bottom(cls) -> AllocStateDomain:
-        return cls(AllocState.BOTTOM)
-
-    @classmethod
-    def top(cls) -> AllocStateDomain:
-        return cls(AllocState.TOP)
-
-    @classmethod
-    def allocated(cls) -> AllocStateDomain:
-        return cls(AllocState.ALLOCATED)
-
-    @classmethod
-    def freed(cls) -> AllocStateDomain:
-        return cls(AllocState.FREED)
-
-    @classmethod
-    def unallocated(cls) -> AllocStateDomain:
-        return cls(AllocState.UNALLOCATED)
-
-    @classmethod
-    def stack_local(cls) -> AllocStateDomain:
-        return cls(AllocState.STACK_LOCAL)
-
-    @classmethod
-    def static(cls) -> AllocStateDomain:
-        return cls(AllocState.STATIC)
-
-    def is_bottom(self) -> bool:
-        return self.state is AllocState.BOTTOM
-
-    def is_top(self) -> bool:
-        return self.state is AllocState.TOP
-
-    def leq(self, other: AllocStateDomain) -> bool:
-        if self.is_bottom():
-            return True
-        if other.is_top():
-            return True
-        return self.state == other.state
-
-    def join(self, other: AllocStateDomain) -> AllocStateDomain:
-        return AllocStateDomain(_ALLOC_JOIN[self.state][other.state])
-
-    def meet(self, other: AllocStateDomain) -> AllocStateDomain:
-        return AllocStateDomain(_ALLOC_MEET[self.state][other.state])
-
-    def widen(self, other: AllocStateDomain) -> AllocStateDomain:
-        return self.join(other)  # finite height
-
-    def narrow(self, other: AllocStateDomain) -> AllocStateDomain:
-        return other
-
-    def __repr__(self) -> str:
-        _NAMES = {
-            AllocState.BOTTOM: "⊥",
-            AllocState.UNALLOCATED: "Unalloc",
-            AllocState.ALLOCATED: "Alloc",
-            AllocState.FREED: "Freed",
-            AllocState.STACK_LOCAL: "Stack",
-            AllocState.STATIC: "Static",
-            AllocState.TOP: "⊤",
-        }
-        return f"AllocState({_NAMES[self.state]})"
-
-
-# ---------------------------------------------------------------------------
-#  1b. Nullness Domain
-# ---------------------------------------------------------------------------
-
-class Nullness(Enum):
-    BOTTOM = auto()
-    NULL = auto()
-    NONNULL = auto()
-    TOP = auto()
-
-
-_NULL_JOIN: Dict[Nullness, Dict[Nullness, Nullness]] = {
-    Nullness.BOTTOM: {s: s for s in Nullness},
-    Nullness.TOP: {s: Nullness.TOP for s in Nullness},
-    Nullness.NULL: {
-        Nullness.BOTTOM: Nullness.NULL,
-        Nullness.NULL: Nullness.NULL,
-        Nullness.NONNULL: Nullness.TOP,
-        Nullness.TOP: Nullness.TOP,
-    },
-    Nullness.NONNULL: {
-        Nullness.BOTTOM: Nullness.NONNULL,
-        Nullness.NULL: Nullness.TOP,
-        Nullness.NONNULL: Nullness.NONNULL,
-        Nullness.TOP: Nullness.TOP,
-    },
-}
-
-_NULL_MEET: Dict[Nullness, Dict[Nullness, Nullness]] = {
-    Nullness.TOP: {s: s for s in Nullness},
-    Nullness.BOTTOM: {s: Nullness.BOTTOM for s in Nullness},
-    Nullness.NULL: {
-        Nullness.TOP: Nullness.NULL,
-        Nullness.NULL: Nullness.NULL,
-        Nullness.NONNULL: Nullness.BOTTOM,
-        Nullness.BOTTOM: Nullness.BOTTOM,
-    },
-    Nullness.NONNULL: {
-        Nullness.TOP: Nullness.NONNULL,
-        Nullness.NULL: Nullness.BOTTOM,
-        Nullness.NONNULL: Nullness.NONNULL,
-        Nullness.BOTTOM: Nullness.BOTTOM,
-    },
-}
-
-
-@dataclass(frozen=True, slots=True)
-class NullnessDom:
-    """Nullness abstract domain: {⊥, Null, NonNull, ⊤}."""
-    nullness: Nullness
-
-    @classmethod
-    def bottom(cls) -> NullnessDom:
-        return cls(Nullness.BOTTOM)
-
-    @classmethod
-    def top(cls) -> NullnessDom:
-        return cls(Nullness.TOP)
-
-    @classmethod
-    def null(cls) -> NullnessDom:
-        return cls(Nullness.NULL)
-
-    @classmethod
-    def nonnull(cls) -> NullnessDom:
-        return cls(Nullness.NONNULL)
-
-    def is_bottom(self) -> bool:
-        return self.nullness is Nullness.BOTTOM
-
-    def is_top(self) -> bool:
-        return self.nullness is Nullness.TOP
-
-    def is_definitely_null(self) -> bool:
-        return self.nullness is Nullness.NULL
-
-    def is_definitely_nonnull(self) -> bool:
-        return self.nullness is Nullness.NONNULL
-
-    def may_be_null(self) -> bool:
-        return self.nullness in (Nullness.NULL, Nullness.TOP)
-
-    def leq(self, other: NullnessDom) -> bool:
-        if self.is_bottom():
-            return True
-        if other.is_top():
-            return True
-        return self.nullness == other.nullness
-
-    def join(self, other: NullnessDom) -> NullnessDom:
-        return NullnessDom(_NULL_JOIN[self.nullness][other.nullness])
-
-    def meet(self, other: NullnessDom) -> NullnessDom:
-        return NullnessDom(_NULL_MEET[self.nullness][other.nullness])
-
-    def widen(self, other: NullnessDom) -> NullnessDom:
-        return self.join(other)
-
-    def narrow(self, other: NullnessDom) -> NullnessDom:
-        return other
-
-    def __repr__(self) -> str:
-        _NAMES = {
-            Nullness.BOTTOM: "⊥", Nullness.NULL: "Null",
-            Nullness.NONNULL: "NonNull", Nullness.TOP: "⊤",
-        }
-        return f"Nullness({_NAMES[self.nullness]})"
-
-
-# ---------------------------------------------------------------------------
-#  1c. Per-Variable Memory State (Product)
-# ---------------------------------------------------------------------------
-#
-#  For each pointer variable we track a tuple:
-#    (NullnessDom, AllocStateDomain, IntervalDomain, IntervalDomain)
-#       ^              ^                  ^               ^
-#    nullness    alloc lifecycle    buffer size [lo,hi]  current offset
-#
-#  The buffer size tracks the allocated size in bytes.
-#  The offset tracks the current byte offset from the base of the buffer.
-#  These allow us to check: 0 ≤ offset < buffer_size on every access.
-
-@dataclass(frozen=True, slots=True)
-class PointerAbstractValue:
-    """
-    Combined abstract value for a single pointer variable.
-
-    Fields:
-        nullness:    Is this pointer NULL, NonNull, or unknown?
-        alloc_state: Is the memory allocated, freed, stack, etc.?
-        buf_size:    Interval bounding the buffer size in bytes.
-        offset:      Interval bounding the byte offset from buffer base.
-        alloc_site:  Optional token of the allocation site (for diagnostics).
-    """
-    nullness: NullnessDom
-    alloc_state: AllocStateDomain
-    buf_size: IntervalDomain
-    offset: IntervalDomain
-    alloc_site: Optional[Any] = None  # cppcheckdata.Token
-
-    @classmethod
-    def bottom(cls) -> PointerAbstractValue:
-        return cls(
-            nullness=NullnessDom.bottom(),
-            alloc_state=AllocStateDomain.bottom(),
-            buf_size=IntervalDomain.bottom(),
-            offset=IntervalDomain.bottom(),
-        )
-
-    @classmethod
-    def top(cls) -> PointerAbstractValue:
-        return cls(
-            nullness=NullnessDom.top(),
-            alloc_state=AllocStateDomain.top(),
-            buf_size=IntervalDomain.top(),
-            offset=IntervalDomain.top(),
-        )
-
-    @classmethod
-    def null_ptr(cls) -> PointerAbstractValue:
-        return cls(
-            nullness=NullnessDom.null(),
-            alloc_state=AllocStateDomain(AllocState.UNALLOCATED),
-            buf_size=IntervalDomain.const(0),
-            offset=IntervalDomain.const(0),
-        )
-
-    @classmethod
-    def heap_alloc(cls, size: IntervalDomain, site=None) -> PointerAbstractValue:
-        return cls(
-            nullness=NullnessDom.top(),  # malloc may return NULL
-            alloc_state=AllocStateDomain.allocated(),
-            buf_size=size,
-            offset=IntervalDomain.const(0),
-            alloc_site=site,
-        )
-
-    @classmethod
-    def stack_buf(cls, size: IntervalDomain) -> PointerAbstractValue:
-        return cls(
-            nullness=NullnessDom.nonnull(),
-            alloc_state=AllocStateDomain.stack_local(),
-            buf_size=size,
-            offset=IntervalDomain.const(0),
-        )
-
-    def is_bottom(self) -> bool:
-        return (self.nullness.is_bottom() and self.alloc_state.is_bottom()
-                and self.buf_size.is_bottom() and self.offset.is_bottom())
-
-    def is_top(self) -> bool:
-        return (self.nullness.is_top() and self.alloc_state.is_top()
-                and self.buf_size.is_top() and self.offset.is_top())
-
-    def join(self, other: PointerAbstractValue) -> PointerAbstractValue:
-        return PointerAbstractValue(
-            nullness=self.nullness.join(other.nullness),
-            alloc_state=self.alloc_state.join(other.alloc_state),
-            buf_size=self.buf_size.join(other.buf_size),
-            offset=self.offset.join(other.offset),
-            alloc_site=self.alloc_site if self.alloc_site == other.alloc_site else None,
-        )
-
-    def meet(self, other: PointerAbstractValue) -> PointerAbstractValue:
-        return PointerAbstractValue(
-            nullness=self.nullness.meet(other.nullness),
-            alloc_state=self.alloc_state.meet(other.alloc_state),
-            buf_size=self.buf_size.meet(other.buf_size),
-            offset=self.offset.meet(other.offset),
-            alloc_site=self.alloc_site,
-        )
-
-    def widen(self, other: PointerAbstractValue) -> PointerAbstractValue:
-        return PointerAbstractValue(
-            nullness=self.nullness.widen(other.nullness),
-            alloc_state=self.alloc_state.widen(other.alloc_state),
-            buf_size=self.buf_size.widen(other.buf_size),
-            offset=self.offset.widen(other.offset),
-            alloc_site=self.alloc_site,
-        )
-
-    def narrow(self, other: PointerAbstractValue) -> PointerAbstractValue:
-        return PointerAbstractValue(
-            nullness=self.nullness.narrow(other.nullness),
-            alloc_state=self.alloc_state.narrow(other.alloc_state),
-            buf_size=self.buf_size.narrow(other.buf_size),
-            offset=self.offset.narrow(other.offset),
-            alloc_site=self.alloc_site,
-        )
-
-    def leq(self, other: PointerAbstractValue) -> bool:
-        return (self.nullness.leq(other.nullness)
-                and self.alloc_state.leq(other.alloc_state)
-                and self.buf_size.leq(other.buf_size)
-                and self.offset.leq(other.offset))
-
-    # ---- Reduction operator (mutual refinement) --------------------------
-
-    def reduce(self) -> PointerAbstractValue:
-        """
-        Apply reduction rules to tighten the product:
-          - If alloc_state = Freed → nullness can be anything (no change)
-          - If nullness = Null → buf_size = [0,0], offset = [0,0]
-          - If buf_size = [0,0] and alloc_state = Allocated → contradiction
-            (malloc(0) is implementation-defined, but we treat it as ⊥)
-          - If offset.lo >= buf_size.hi (and both finite) → out-of-bounds
-            (we don't reduce to ⊥ here — that's the checker's job)
-        """
-        n, a, s, o = self.nullness, self.alloc_state, self.buf_size, self.offset
-
-        # Null pointer has no buffer
-        if n.is_definitely_null():
-            return PointerAbstractValue(
-                nullness=n,
-                alloc_state=AllocStateDomain(AllocState.UNALLOCATED),
-                buf_size=IntervalDomain.const(0),
-                offset=IntervalDomain.const(0),
-                alloc_site=self.alloc_site,
-            )
-
-        # Freed memory: keep tracking but nullness can be NonNull (dangling)
-        # No reduction needed.
-
-        # Allocated with non-null: refine nullness
-        if a.state is AllocState.ALLOCATED:
-            # malloc can return NULL, so only refine if we already know NonNull
-            pass
-
-        # Stack/static are always non-null
-        if a.state in (AllocState.STACK_LOCAL, AllocState.STATIC):
-            n = NullnessDom.nonnull()
-
-        return PointerAbstractValue(
-            nullness=n, alloc_state=a, buf_size=s, offset=o,
-            alloc_site=self.alloc_site,
-        )
-
-    def __repr__(self) -> str:
-        return (f"PtrVal({self.nullness}, {self.alloc_state}, "
-                f"size={self.buf_size}, off={self.offset})")
-
-
-# ---------------------------------------------------------------------------
-#  1d. Integer Abstract Value
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True, slots=True)
-class IntAbstractValue:
-    """
-    Abstract value for integer variables: an interval with optional
-    taint tracking.
-    """
-    interval: IntervalDomain
-    is_tainted: bool = False  # from untrusted source?
-
-    @classmethod
-    def bottom(cls) -> IntAbstractValue:
-        return cls(interval=IntervalDomain.bottom())
-
-    @classmethod
-    def top(cls) -> IntAbstractValue:
-        return cls(interval=IntervalDomain.top())
-
-    @classmethod
-    def const(cls, n: int) -> IntAbstractValue:
-        return cls(interval=IntervalDomain.const(n))
-
-    @classmethod
-    def range(cls, lo: int, hi: int) -> IntAbstractValue:
-        return cls(interval=IntervalDomain.range(lo, hi))
-
-    def is_bottom(self) -> bool:
-        return self.interval.is_bottom()
-
-    def is_top(self) -> bool:
-        return self.interval.is_top()
-
-    def join(self, other: IntAbstractValue) -> IntAbstractValue:
-        return IntAbstractValue(
-            interval=self.interval.join(other.interval),
-            is_tainted=self.is_tainted or other.is_tainted,
-        )
-
-    def meet(self, other: IntAbstractValue) -> IntAbstractValue:
-        return IntAbstractValue(
-            interval=self.interval.meet(other.interval),
-            is_tainted=self.is_tainted and other.is_tainted,
-        )
-
-    def widen(self, other: IntAbstractValue) -> IntAbstractValue:
-        return IntAbstractValue(
-            interval=self.interval.widen(other.interval),
-            is_tainted=self.is_tainted or other.is_tainted,
-        )
-
-    def narrow(self, other: IntAbstractValue) -> IntAbstractValue:
-        return IntAbstractValue(
-            interval=self.interval.narrow(other.interval),
-            is_tainted=self.is_tainted and other.is_tainted,
-        )
-
-    def leq(self, other: IntAbstractValue) -> bool:
-        return self.interval.leq(other.interval)
-
-    def add(self, other: IntAbstractValue) -> IntAbstractValue:
-        return IntAbstractValue(
-            interval=self.interval.add(other.interval),
-            is_tainted=self.is_tainted or other.is_tainted,
-        )
-
-    def sub(self, other: IntAbstractValue) -> IntAbstractValue:
-        return IntAbstractValue(
-            interval=self.interval.sub(other.interval),
-            is_tainted=self.is_tainted or other.is_tainted,
-        )
-
-    def mul(self, other: IntAbstractValue) -> IntAbstractValue:
-        return IntAbstractValue(
-            interval=self.interval.mul(other.interval),
-            is_tainted=self.is_tainted or other.is_tainted,
-        )
-
-    def __repr__(self) -> str:
-        t = " TAINTED" if self.is_tainted else ""
-        return f"Int({self.interval}{t})"
-
-
-# ---------------------------------------------------------------------------
-#  1e. Memory State — The Full Abstract State
-# ---------------------------------------------------------------------------
 
 @dataclass
-class MemoryState:
+class PtrInfo:
+    state: AllocState = AllocState.UNKNOWN
+    alloc_tok: Optional[Any] = None
+    free_tok: Optional[Any] = None
+    is_offset: bool = False
+    alloc_size: Optional[int] = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PASS 1 — MEMORY SAFETY (typestate, forward token walk)
+# ═══════════════════════════════════════════════════════════════════
+
+class MemSafetyAnalysis:
     """
-    Abstract state at a program point: maps variable names to abstract values.
-
-    Pointer variables → PointerAbstractValue
-    Integer variables → IntAbstractValue
-
-    This is the environment lattice:  Var → (PtrVal + IntVal)
-    with pointwise join/meet/widen/narrow.
-    """
-    pointers: Dict[str, PointerAbstractValue] = field(default_factory=dict)
-    integers: Dict[str, IntAbstractValue] = field(default_factory=dict)
-    _is_bottom: bool = False
-
-    @classmethod
-    def bottom(cls) -> MemoryState:
-        return cls(_is_bottom=True)
-
-    @classmethod
-    def top(cls) -> MemoryState:
-        return cls()  # empty maps = all variables map to ⊤ implicitly
-
-    def is_bottom(self) -> bool:
-        return self._is_bottom
-
-    def copy(self) -> MemoryState:
-        if self._is_bottom:
-            return MemoryState.bottom()
-        return MemoryState(
-            pointers=dict(self.pointers),
-            integers=dict(self.integers),
-        )
-
-    def get_ptr(self, var: str) -> PointerAbstractValue:
-        if self._is_bottom:
-            return PointerAbstractValue.bottom()
-        return self.pointers.get(var, PointerAbstractValue.top())
-
-    def set_ptr(self, var: str, val: PointerAbstractValue) -> MemoryState:
-        if self._is_bottom:
-            return self
-        new = self.copy()
-        new.pointers[var] = val.reduce()
-        return new
-
-    def get_int(self, var: str) -> IntAbstractValue:
-        if self._is_bottom:
-            return IntAbstractValue.bottom()
-        return self.integers.get(var, IntAbstractValue.top())
-
-    def set_int(self, var: str, val: IntAbstractValue) -> MemoryState:
-        if self._is_bottom:
-            return self
-        new = self.copy()
-        new.integers[var] = val
-        return new
-
-    def join(self, other: MemoryState) -> MemoryState:
-        if self._is_bottom:
-            return other.copy()
-        if other._is_bottom:
-            return self.copy()
-
-        result = MemoryState()
-
-        # Pointwise join for pointers
-        all_ptr_vars = set(self.pointers.keys()) | set(other.pointers.keys())
-        for var in all_ptr_vars:
-            v1 = self.pointers.get(var, PointerAbstractValue.top())
-            v2 = other.pointers.get(var, PointerAbstractValue.top())
-            result.pointers[var] = v1.join(v2)
-
-        # Pointwise join for integers
-        all_int_vars = set(self.integers.keys()) | set(other.integers.keys())
-        for var in all_int_vars:
-            v1 = self.integers.get(var, IntAbstractValue.top())
-            v2 = other.integers.get(var, IntAbstractValue.top())
-            result.integers[var] = v1.join(v2)
-
-        return result
-
-    def widen(self, other: MemoryState) -> MemoryState:
-        if self._is_bottom:
-            return other.copy()
-        if other._is_bottom:
-            return self.copy()
-
-        result = MemoryState()
-
-        all_ptr_vars = set(self.pointers.keys()) | set(other.pointers.keys())
-        for var in all_ptr_vars:
-            v1 = self.pointers.get(var, PointerAbstractValue.top())
-            v2 = other.pointers.get(var, PointerAbstractValue.top())
-            result.pointers[var] = v1.widen(v2)
-
-        all_int_vars = set(self.integers.keys()) | set(other.integers.keys())
-        for var in all_int_vars:
-            v1 = self.integers.get(var, IntAbstractValue.top())
-            v2 = other.integers.get(var, IntAbstractValue.top())
-            result.integers[var] = v1.widen(v2)
-
-        return result
-
-    def narrow(self, other: MemoryState) -> MemoryState:
-        if self._is_bottom:
-            return self
-        if other._is_bottom:
-            return other
-
-        result = MemoryState()
-
-        all_ptr_vars = set(self.pointers.keys()) | set(other.pointers.keys())
-        for var in all_ptr_vars:
-            v1 = self.pointers.get(var, PointerAbstractValue.top())
-            v2 = other.pointers.get(var, PointerAbstractValue.top())
-            result.pointers[var] = v1.narrow(v2)
-
-        all_int_vars = set(self.integers.keys()) | set(other.integers.keys())
-        for var in all_int_vars:
-            v1 = self.integers.get(var, IntAbstractValue.top())
-            v2 = other.integers.get(var, IntAbstractValue.top())
-            result.integers[var] = v1.narrow(v2)
-
-        return result
-
-    def leq(self, other: MemoryState) -> bool:
-        if self._is_bottom:
-            return True
-        if other._is_bottom:
-            return False
-
-        for var, v1 in self.pointers.items():
-            v2 = other.pointers.get(var, PointerAbstractValue.top())
-            if not v1.leq(v2):
-                return False
-
-        for var, v1 in self.integers.items():
-            v2 = other.integers.get(var, IntAbstractValue.top())
-            if not v1.leq(v2):
-                return False
-
-        return True
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, MemoryState):
-            return NotImplemented
-        if self._is_bottom and other._is_bottom:
-            return True
-        if self._is_bottom or other._is_bottom:
-            return False
-        return self.pointers == other.pointers and self.integers == other.integers
-
-    def __repr__(self) -> str:
-        if self._is_bottom:
-            return "MemState(⊥)"
-        parts = []
-        for k, v in sorted(self.pointers.items()):
-            parts.append(f"{k}→{v}")
-        for k, v in sorted(self.integers.items()):
-            parts.append(f"{k}→{v}")
-        return "MemState({" + ", ".join(parts) + "})"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  PART 2 — MEMORY SAFETY DATAFLOW ANALYSIS
-# ═══════════════════════════════════════════════════════════════════════════
-
-class MemorySafetyAnalysis(ForwardAnalysis):
-    """
-    Forward dataflow analysis tracking memory-safety properties.
-
-    For each program point, computes a MemoryState mapping each variable
-    to its abstract value (pointer info or integer interval).
-
-    Transfer functions handle:
-        - Assignments (x = expr)
-        - Allocations (malloc, calloc, realloc, etc.)
-        - Deallocations (free)
-        - Pointer arithmetic (p + i, p[i])
-        - Buffer operations (memcpy, strcpy, etc.)
-        - Conditional branches (refine intervals and nullness)
-        - Function calls (with library summaries)
+    CWE-415 (double free), CWE-416 (use-after-free),
+    CWE-401 (leak), CWE-476 (null deref),
+    CWE-590 (free non-heap), CWE-761 (free offset ptr).
     """
 
-    def __init__(self, cfg_data, type_analyzer: Optional[TypeAnalyzer] = None):
-        super().__init__(
-            domain=None,  # We manage MemoryState directly
-            direction="forward",
-        )
-        self.cfg_data = cfg_data
-        self.type_analyzer = type_analyzer
-        self.findings: List[Finding] = []
+    def __init__(self, reporter: Reporter) -> None:
+        self.reporter = reporter
+        self.env: Dict[int, PtrInfo] = {}
 
-        # Widening thresholds: common buffer sizes and loop bounds
-        self.thresholds: List[float] = [
-            0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
-            1024, 2048, 4096, 8192, 16384, 32768, 65536,
-            1 << 20, 1 << 24, 1 << 30,
-            # Common C type max values
-            127, 255, 32767, 65535,
-            2147483647, 4294967295,
-        ]
-        self.thresholds.sort()
+    def run(self, cfg_data: Any) -> None:
+        """Iterate over the full token list for each configuration."""
+        self.env.clear()
 
-    # ---- Analysis interface ----------------------------------------------
+        # Walk the ENTIRE token list — this is the reliable way
+        for tok in cfg_data.tokenlist:
+            self._visit(tok)
 
-    def initial_value(self) -> MemoryState:
-        return MemoryState.bottom()
+        # Leak check at end of each function scope
+        for scope in getattr(cfg_data, "scopes", []):
+            stype = getattr(scope, "type", "")
+            if stype in ("Function",):
+                self._check_leaks(scope)
 
-    def boundary_value(self) -> MemoryState:
-        """At function entry, all parameters are ⊤ (unknown)."""
-        return MemoryState.top()
+    def _visit(self, tok: Any) -> None:
+        s = _s(tok)
 
-    def merge(self, s1: MemoryState, s2: MemoryState) -> MemoryState:
-        return s1.join(s2)
+        # ── p = malloc(...) / p = NULL / p = &x / p = q ──
+        if s == "=":
+            self._on_assign(tok)
+            return
 
-    def widen_states(self, old: MemoryState, new: MemoryState) -> MemoryState:
-        """Widening with thresholds for interval components."""
-        if old.is_bottom():
-            return new.copy()
-        if new.is_bottom():
-            return old.copy()
+        # ── free(p) — detected via the '(' whose func-name is 'free' ──
+        if s == "(" and _is_free(getattr(tok, "astOperand1", None)):
+            self._on_free(tok)
+            return
 
-        result = MemoryState()
+        # ── dereferences: *p  p[i]  p->m ──
+        if s == "*" and getattr(tok, "astOperand1", None) and not getattr(tok, "astOperand2", None):
+            # Unary dereference: * has only astOperand1
+            self._check_deref(tok, getattr(tok, "astOperand1", None))
+        elif s == "[":
+            self._check_deref(tok, getattr(tok, "astOperand1", None))
+        elif s == "->":
+            self._check_deref(tok, getattr(tok, "astOperand1", None))
 
-        all_ptr_vars = set(old.pointers.keys()) | set(new.pointers.keys())
-        for var in all_ptr_vars:
-            v1 = old.pointers.get(var, PointerAbstractValue.top())
-            v2 = new.pointers.get(var, PointerAbstractValue.top())
-            # Use threshold widening for the interval components
-            result.pointers[var] = PointerAbstractValue(
-                nullness=v1.nullness.widen(v2.nullness),
-                alloc_state=v1.alloc_state.widen(v2.alloc_state),
-                buf_size=v1.buf_size.widen_with_thresholds(
-                    v2.buf_size, self.thresholds),
-                offset=v1.offset.widen_with_thresholds(
-                    v2.offset, self.thresholds),
-                alloc_site=v1.alloc_site,
-            )
+        # ── Pointer arithmetic: p++  p+=N ──
+        if s in ("++", "--"):
+            target = getattr(tok, "astOperand1", None)
+            vid = _var_id(target)
+            if vid and vid in self.env:
+                self.env[vid].is_offset = True
 
-        all_int_vars = set(old.integers.keys()) | set(new.integers.keys())
-        for var in all_int_vars:
-            v1 = old.integers.get(var, IntAbstractValue.top())
-            v2 = new.integers.get(var, IntAbstractValue.top())
-            result.integers[var] = IntAbstractValue(
-                interval=v1.interval.widen_with_thresholds(
-                    v2.interval, self.thresholds
-                ),
-                is_tainted=v1.is_tainted or v2.is_tainted,
-            )
-
-        return result
-
-    def transfer(self, block: BasicBlock, in_state: MemoryState) -> MemoryState:
-        """Transfer function for a basic block."""
-        if in_state.is_bottom():
-            return MemoryState.bottom()
-
-        state = in_state.copy()
-
-        for token in block.tokens:
-            state = self._transfer_token(token, state)
-
-        return state
-
-    # ---- Per-token transfer functions ------------------------------------
-
-    def _transfer_token(self, token, state: MemoryState) -> MemoryState:
-        """Dispatch transfer function for a single token/statement."""
-        if token is None:
-            return state
-
-        # Assignment: x = expr
-        if self._is_assignment(token):
-            return self._transfer_assignment(token, state)
-
-        # Function call (not as part of assignment)
-        if self._is_function_call(token):
-            return self._transfer_call(token, state)
-
-        # Pointer dereference: *p or p[i] (check, don't modify state)
-        if self._is_deref(token):
-            self._check_deref(token, state)
-
-        # Array subscript: a[i] (check bounds)
-        if self._is_array_access(token):
-            self._check_array_access(token, state)
-
-        return state
-
-    def _transfer_assignment(self, token, state: MemoryState) -> MemoryState:
-        """Handle x = expr."""
-        lhs = token.astOperand1
-        rhs = token.astOperand2
-
+    def _on_assign(self, tok: Any) -> None:
+        """Handle lhs = rhs."""
+        lhs = getattr(tok, "astOperand1", None)
+        rhs = getattr(tok, "astOperand2", None)
         if lhs is None or rhs is None:
-            return state
-
-        lhs_var = self._get_var_name(lhs)
-        if lhs_var is None:
-            return state
-
-        # Determine if LHS is a pointer or integer
-        if self._is_pointer_var(lhs):
-            rhs_val = self._eval_ptr_expr(rhs, state)
-            state = state.set_ptr(lhs_var, rhs_val)
-        else:
-            rhs_val = self._eval_int_expr(rhs, state)
-            state = state.set_int(lhs_var, rhs_val)
-
-        return state
-
-    def _transfer_call(self, token, state: MemoryState) -> MemoryState:
-        """Handle function calls that affect memory state."""
-        func_name = self._get_called_func_name(token)
-        if func_name is None:
-            return state
-
-        args = self._get_call_args(token)
-
-        # --- Allocation ---
-        if func_name in _ALLOC_FUNCS:
-            return self._transfer_alloc(func_name, token, args, state)
-
-        # --- Deallocation ---
-        if func_name in _FREE_FUNCS:
-            return self._transfer_free(func_name, token, args, state)
-
-        # --- Realloc (special: both alloc and free) ---
-        if func_name == "realloc":
-            return self._transfer_realloc(token, args, state)
-
-        # --- Buffer operations ---
-        if func_name in _BUFFER_FUNCS:
-            self._check_buffer_op(func_name, token, args, state)
-            return state
-
-        # --- Unbounded copy (always warn) ---
-        if func_name in _UNBOUNDED_COPY_FUNCS:
-            self._check_unbounded_copy(func_name, token, args, state)
-            return state
-
-        return state
-
-    # ---- Allocation transfer functions -----------------------------------
-
-    def _transfer_alloc(
-        self, func_name: str, token, args: List, state: MemoryState
-    ) -> MemoryState:
-        """Transfer for malloc/calloc/etc."""
-        # Determine the assigned variable (if any)
-        assign_var = self._get_assign_target(token)
-        if assign_var is None:
-            return state
-
-        # Compute the allocation size
-        size_interval = self._compute_alloc_size(func_name, args, state)
-
-        # Check CWE-789: excessive allocation size
-        if (not size_interval.is_bottom()
-                and math.isfinite(size_interval.hi)
-                and size_interval.hi > _MAX_REASONABLE_ALLOC):
-            self._report(
-                token, CWE.CWE_789, Severity.WARNING,
-                f"Allocation size may be excessive: {size_interval}"
-            )
-
-        # Check CWE-789: tainted size
-        for arg in args:
-            arg_name = self._get_var_name(arg)
-            if arg_name:
-                int_val = state.get_int(arg_name)
-                if int_val.is_tainted:
-                    self._report(
-                        token, CWE.CWE_789, Severity.WARNING,
-                        f"Allocation size from tainted source: {arg_name}"
-                    )
-
-        # Model the result
-        ptr_val = PointerAbstractValue.heap_alloc(size_interval, site=token)
-        state = state.set_ptr(assign_var, ptr_val)
-
-        return state
-
-    def _transfer_free(
-        self, func_name: str, token, args: List, state: MemoryState
-    ) -> MemoryState:
-        """Transfer for free()."""
-        ptr_idx = _FREE_FUNCS[func_name]
-        if ptr_idx >= len(args):
-            return state
-
-        ptr_arg = args[ptr_idx]
-        ptr_name = self._get_var_name(ptr_arg)
-        if ptr_name is None:
-            return state
-
-        ptr_val = state.get_ptr(ptr_name)
-
-        # Check CWE-415: Double free
-        if ptr_val.alloc_state.state is AllocState.FREED:
-            self._report(
-                token, CWE.CWE_415, Severity.ERROR,
-                f"Double free of '{ptr_name}'"
-                + (f" (allocated at {ptr_val.alloc_site.file}:{ptr_val.alloc_site.linenr})"
-                   if ptr_val.alloc_site else "")
-            )
-
-        # Check CWE-590: Free of non-heap memory
-        if ptr_val.alloc_state.state in (AllocState.STACK_LOCAL, AllocState.STATIC):
-            self._report(
-                token, CWE.CWE_590, Severity.ERROR,
-                f"Free of non-heap pointer '{ptr_name}' "
-                f"(state: {ptr_val.alloc_state})"
-            )
-
-        # Check CWE-761: Free of pointer not at start of buffer
-        if not ptr_val.offset.is_bottom() and not ptr_val.offset.is_top():
-            if ptr_val.offset.lo > 0 or ptr_val.offset.hi < 0:
-                # Offset is definitely not zero
-                if not ptr_val.offset.contains(0):
-                    self._report(
-                        token, CWE.CWE_761, Severity.ERROR,
-                        f"Free of pointer '{ptr_name}' not at start of buffer "
-                        f"(offset: {ptr_val.offset})"
-                    )
-
-        # Check CWE-476: Free of null pointer (technically defined in C,
-        # but often indicates a bug)
-        if ptr_val.nullness.is_definitely_null():
-            # free(NULL) is a no-op in C, not a bug — skip
-            return state
-
-        # Update state: mark as freed
-        freed_val = PointerAbstractValue(
-            nullness=ptr_val.nullness,
-            alloc_state=AllocStateDomain.freed(),
-            buf_size=ptr_val.buf_size,
-            offset=ptr_val.offset,
-            alloc_site=ptr_val.alloc_site,
-        )
-        state = state.set_ptr(ptr_name, freed_val)
-
-        return state
-
-    def _transfer_realloc(
-        self, token, args: List, state: MemoryState
-    ) -> MemoryState:
-        """Transfer for realloc(ptr, size)."""
-        assign_var = self._get_assign_target(token)
-
-        if len(args) >= 1:
-            old_ptr_name = self._get_var_name(args[0])
-            if old_ptr_name:
-                old_val = state.get_ptr(old_ptr_name)
-                # Check CWE-416: realloc of freed pointer
-                if old_val.alloc_state.state is AllocState.FREED:
-                    self._report(
-                        token, CWE.CWE_416, Severity.ERROR,
-                        f"realloc of freed pointer '{old_ptr_name}'"
-                    )
-                # Old pointer is now potentially invalid
-                # (realloc may move the block)
-                state = state.set_ptr(
-                    old_ptr_name,
-                    PointerAbstractValue(
-                        nullness=NullnessDom.top(),
-                        alloc_state=AllocStateDomain.top(),  # might be freed if realloc moved it
-                        buf_size=IntervalDomain.top(),
-                        offset=IntervalDomain.const(0),
-                    )
-                )
-
-        # Compute new size
-        new_size = IntervalDomain.top()
-        if len(args) >= 2:
-            size_val = self._eval_int_expr(args[1], state)
-            new_size = size_val.interval
-
-        if assign_var:
-            ptr_val = PointerAbstractValue.heap_alloc(new_size, site=token)
-            state = state.set_ptr(assign_var, ptr_val)
-
-        return state
-
-    # ---- Expression evaluation -------------------------------------------
-
-    def _eval_ptr_expr(self, token, state: MemoryState) -> PointerAbstractValue:
-        """Evaluate a pointer expression to its abstract value."""
-        if token is None:
-            return PointerAbstractValue.top()
-
-        # NULL literal (0 or NULL)
-        if token.isNumber and self._token_int_value(token) == 0:
-            return PointerAbstractValue.null_ptr()
-
-        if token.str == "NULL" or token.str == "nullptr":
-            return PointerAbstractValue.null_ptr()
-
-        # Variable reference
-        var_name = self._get_var_name(token)
-        if var_name:
-            return state.get_ptr(var_name)
-
-        # malloc/calloc/etc. call
-        func_name = self._get_called_func_name(token)
-        if func_name and func_name in _ALLOC_FUNCS:
-            args = self._get_call_args(token)
-            size = self._compute_alloc_size(func_name, args, state)
-            return PointerAbstractValue.heap_alloc(size, site=token)
-
-        # Pointer arithmetic: p + i or p - i
-        if token.str == "+" and token.astOperand1 and token.astOperand2:
-            left = self._eval_ptr_expr(token.astOperand1, state)
-            right = self._eval_int_expr(token.astOperand2, state)
-            if not left.is_top():
-                elem_size = self._get_pointee_size(token.astOperand1)
-                byte_offset = right.interval.mul(
-                    IntervalDomain.const(elem_size))
-                new_offset = left.offset.add(byte_offset)
-                return PointerAbstractValue(
-                    nullness=left.nullness,
-                    alloc_state=left.alloc_state,
-                    buf_size=left.buf_size,
-                    offset=new_offset,
-                    alloc_site=left.alloc_site,
-                ).reduce()
-            return PointerAbstractValue.top()
-
-        if token.str == "-" and token.astOperand1 and token.astOperand2:
-            left = self._eval_ptr_expr(token.astOperand1, state)
-            right = self._eval_int_expr(token.astOperand2, state)
-            if not left.is_top():
-                elem_size = self._get_pointee_size(token.astOperand1)
-                byte_offset = right.interval.mul(
-                    IntervalDomain.const(elem_size))
-                new_offset = left.offset.sub(byte_offset)
-                return PointerAbstractValue(
-                    nullness=left.nullness,
-                    alloc_state=left.alloc_state,
-                    buf_size=left.buf_size,
-                    offset=new_offset,
-                    alloc_site=left.alloc_site,
-                ).reduce()
-            return PointerAbstractValue.top()
-
-        # Address-of: &x → stack local
-        if token.str == "&" and token.astOperand1:
-            inner = token.astOperand1
-            if inner and inner.variable:
-                var = inner.variable
-                size = self._get_var_size(var)
-                return PointerAbstractValue.stack_buf(
-                    IntervalDomain.const(size)
-                )
-
-        # Cast: (type*)expr — propagate through
-        if token.str == "(" and token.astOperand1:
-            return self._eval_ptr_expr(token.astOperand1, state)
-
-        # Ternary: cond ? a : b → join
-        if token.str == "?" and token.astOperand2 and token.astOperand2.str == ":":
-            colon = token.astOperand2
-            true_val = self._eval_ptr_expr(colon.astOperand1, state)
-            false_val = self._eval_ptr_expr(colon.astOperand2, state)
-            return true_val.join(false_val)
-
-        return PointerAbstractValue.top()
-
-    def _eval_int_expr(self, token, state: MemoryState) -> IntAbstractValue:
-        """Evaluate an integer expression to its abstract value."""
-        if token is None:
-            return IntAbstractValue.top()
-
-        # Integer literal
-        if token.isNumber:
-            val = self._token_int_value(token)
-            if val is not None:
-                return IntAbstractValue.const(val)
-            return IntAbstractValue.top()
-
-        # Variable reference
-        var_name = self._get_var_name(token)
-        if var_name:
-            return state.get_int(var_name)
-
-        # sizeof(type)
-        if token.str == "sizeof":
-            size = self._eval_sizeof(token)
-            if size is not None:
-                return IntAbstractValue.const(size)
-            return IntAbstractValue(interval=IntervalDomain.at_least(1))
-
-        # Binary arithmetic
-        if token.astOperand1 and token.astOperand2:
-            left = self._eval_int_expr(token.astOperand1, state)
-            right = self._eval_int_expr(token.astOperand2, state)
-
-            if token.str == "+":
-                return left.add(right)
-            elif token.str == "-":
-                return left.sub(right)
-            elif token.str == "*":
-                return left.mul(right)
-            elif token.str == "/":
-                if right.interval.contains(0):
-                    return IntAbstractValue.top()
-                return IntAbstractValue(
-                    interval=left.interval.div(right.interval),
-                    is_tainted=left.is_tainted or right.is_tainted,
-                )
-            elif token.str == "%":
-                return IntAbstractValue(
-                    interval=left.interval.mod(right.interval),
-                    is_tainted=left.is_tainted or right.is_tainted,
-                )
-            elif token.str == "<<":
-                return IntAbstractValue(
-                    interval=left.interval.shift_left(right.interval),
-                    is_tainted=left.is_tainted or right.is_tainted,
-                )
-            elif token.str == "&":
-                return IntAbstractValue(
-                    interval=left.interval.bitwise_and(right.interval),
-                    is_tainted=left.is_tainted or right.is_tainted,
-                )
-
-        # Unary minus
-        if token.str == "-" and token.astOperand1 and not token.astOperand2:
-            inner = self._eval_int_expr(token.astOperand1, state)
-            return IntAbstractValue(
-                interval=inner.interval.negate(),
-                is_tainted=inner.is_tainted,
-            )
-
-        # Function call returning int (e.g., strlen)
-        func_name = self._get_called_func_name(token)
-        if func_name == "strlen":
-            args = self._get_call_args(token)
-            if args:
-                ptr_name = self._get_var_name(args[0])
-                if ptr_name:
-                    ptr_val = state.get_ptr(ptr_name)
-                    if not ptr_val.buf_size.is_top():
-                        # strlen(s) ∈ [0, buf_size - 1]
-                        max_len = ptr_val.buf_size.sub(IntervalDomain.const(1))
-                        return IntAbstractValue(
-                            interval=IntervalDomain(0.0, max(max_len.hi, 0.0))
-                        )
-            return IntAbstractValue(interval=IntervalDomain.at_least(0))
-
-        # Ternary
-        if token.str == "?" and token.astOperand2 and token.astOperand2.str == ":":
-            colon = token.astOperand2
-            true_val = self._eval_int_expr(colon.astOperand1, state)
-            false_val = self._eval_int_expr(colon.astOperand2, state)
-            return true_val.join(false_val)
-
-        return IntAbstractValue.top()
-
-    # ---- Condition refinement (for branch edges) -------------------------
-
-    def refine_for_condition(
-        self, state: MemoryState, cond_token, branch: bool
-    ) -> MemoryState:
-        """
-        Refine the abstract state based on a branch condition.
-
-        For `if (cond)`:
-            branch=True  → state in the true branch
-            branch=False → state in the false branch
-
-        This is critical for precision: after `if (p != NULL)`,
-        we know p is NonNull in the true branch and possibly Null
-        in the false branch.
-        """
-        if state.is_bottom() or cond_token is None:
-            return state
-
-        state = state.copy()
-
-        # --- Null checks: if (p), if (p != NULL), if (p == NULL) ---
-        state = self._refine_nullness(state, cond_token, branch)
-
-        # --- Comparison: if (i < n), if (i >= 0), etc. ---
-        state = self._refine_comparison(state, cond_token, branch)
-
-        return state
-
-    def _refine_nullness(
-        self, state: MemoryState, token, branch: bool
-    ) -> MemoryState:
-        """Refine nullness based on pointer truth tests."""
-        # Pattern: if (p)
-        if token.isName and token.variable and self._is_pointer_var(token):
-            var_name = self._get_var_name(token)
-            if var_name:
-                ptr_val = state.get_ptr(var_name)
-                if branch:
-                    # True branch: p is non-null
-                    new_val = PointerAbstractValue(
-                        nullness=NullnessDom.nonnull(),
-                        alloc_state=ptr_val.alloc_state,
-                        buf_size=ptr_val.buf_size,
-                        offset=ptr_val.offset,
-                        alloc_site=ptr_val.alloc_site,
-                    )
-                else:
-                    # False branch: p is null
-                    new_val = PointerAbstractValue.null_ptr()
-                state = state.set_ptr(var_name, new_val)
-            return state
-
-        # Pattern: if (p != NULL) or if (p != 0)
-        if token.str == "!=" and token.astOperand1 and token.astOperand2:
-            if access_size.hi > effective_size.lo and not (access_size.lo > effective_size.hi):
-                # There is overlap between access range and OOB region
-                # Compute evidence strength
-                if effective_size.lo > 0:
-                    oob_portion = max(0, access_size.hi - effective_size.lo)
-                    total_range = access_size.size()
-                    if total_range > 0 and (oob_portion / total_range) > 0.3:
-                        cwe = 787 if is_write else 125
-                        if buf.heap_state.state == HeapState.STACK_LOCAL:
-                            cwe = 121
-                        elif buf.heap_state.state == HeapState.ALLOCATED:
-                            cwe = 122
-                        self._collector.report(
-                            token,
-                            Severity.WARNING,
-                            f"{func_name}(): potential overflow — "
-                            f"writing up to {access_size} bytes to '{var_name}' "
-                            f"(available: {effective_size} bytes)",
-                            cwe=cwe,
-                            check_id="memfunc-overflow-possible",
-                        )
-
-    def _check_alloc_size(self, token, size: IntervalDomain) -> None:
-        """CWE-789: Check for excessive allocation size."""
-        if size.is_top() or size.is_bottom():
-            return
-        # Flag if the allocation could be excessively large
-        # (e.g., > 1GB — a heuristic threshold)
-        EXCESSIVE_THRESHOLD = 1 << 30  # 1 GiB
-        if size.hi > EXCESSIVE_THRESHOLD:
-            self._collector.report(
-                token,
-                Severity.WARNING,
-                f"Memory allocation with potentially excessive size: "
-                f"{size} bytes (may exceed {EXCESSIVE_THRESHOLD // (1 << 20)} MiB)",
-                cwe=789,
-                check_id="excessive-alloc",
-            )
-        # Flag if size could be zero (malloc(0) is implementation-defined)
-        if size.lo <= 0:
-            self._collector.report(
-                token,
-                Severity.WARNING,
-                f"Memory allocation with potentially zero or negative size: {size}",
-                cwe=131,
-                check_id="alloc-size-zero-or-negative",
-            )
-
-    def _is_write_context(self, token) -> bool:
-        """
-        Heuristic: determine if a subscript/deref is in a write context.
-        Check if the token is on the LHS of an assignment.
-        """
-        parent = getattr(token, "astParent", None)
-        if parent is None:
-            return False
-        parent_str = getattr(parent, "str", "")
-        if parent_str in ("=", "+=", "-=", "*=", "/=", "%=",
-                          "&=", "|=", "^=", "<<=", ">>="):
-            # Check if token is on the LHS
-            lhs = getattr(parent, "astOperand1", None)
-            if lhs is token:
-                return True
-            # Could be nested: parent.astOperand1 is '[' which is our token
-            if lhs is not None and getattr(lhs, "Id", None) == getattr(token, "Id", None):
-                return True
-        return False
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 5 — VARIABLE DECLARATION SCANNER
-# ═══════════════════════════════════════════════════════════════════════════
-
-class VarDeclScanner:
-    """
-    Scans variable declarations to initialize the abstract state with
-    known buffer sizes for local arrays and stack variables.
-    """
-
-    @staticmethod
-    def scan_function_scope(scope, state: MemState) -> MemState:
-        """
-        Scan a function scope for local variable declarations and
-        populate the initial state with known buffer information.
-        """
-        if not hasattr(scope, "varlist"):
-            return state
-
-        for var in getattr(scope, "varlist", []):
-            if var is None:
-                continue
-            name = getattr(var.nameToken, "str",
-                           None) if var.nameToken else None
-            if name is None:
-                continue
-
-            is_array = getattr(var, "isArray", False)
-            is_pointer = getattr(var, "isPointer", False)
-
-            if is_array:
-                arr_size = _get_array_size(var)
-                elem_sz = _get_sizeof(var.nameToken)
-                if arr_size is not None:
-                    total_bytes = arr_size * elem_sz
-                    info = BufferInfo.stack_buffer(total_bytes, elem_sz)
-                    state = state.set_buffer(name, info)
-                else:
-                    # VLA or unknown-size array
-                    info = BufferInfo(
-                        alloc_size=IntervalDomain.at_least(1),
-                        offset=IntervalDomain.const(0),
-                        elem_size=elem_sz,
-                        heap_state=HeapStateDomain.stack_local(),
-                        is_null_terminated=FlatDomain.lift(False),
-                    )
-                    state = state.set_buffer(name, info)
-
-            elif is_pointer:
-                # Uninitialized pointer — could be anything
-                # We do NOT mark it as null or allocated — leave as top
-                # to avoid false positives on unmodeled external assignments
-                pass
-
-            else:
-                # Integer/scalar variable — initialize to top
-                pass
-
-        return state
-
-    @staticmethod
-    def scan_function_args(function, state: MemState) -> MemState:
-        """
-        Scan function arguments. Pointer arguments are assumed to be
-        valid (non-null, allocated) unless the function is annotated
-        otherwise. This is a sound assumption for well-formed programs
-        and reduces false positives.
-        """
-        if function is None:
-            return state
-        arguments = getattr(function, "argument", {})
-        if not arguments:
-            return state
-
-        for arg_nr, arg_var in arguments.items():
-            if arg_var is None:
-                continue
-            name = getattr(arg_var.nameToken, "str",
-                           None) if arg_var.nameToken else None
-            if name is None:
-                continue
-
-            is_pointer = getattr(arg_var, "isPointer", False)
-            is_array = getattr(arg_var, "isArray", False)
-
-            if is_pointer or is_array:
-                # Assume argument pointers are valid but with unknown size
-                # This is sound because we report issues only when we can
-                # prove a violation, not when we can't prove safety
-                info = BufferInfo(
-                    alloc_size=IntervalDomain.at_least(1),
-                    offset=IntervalDomain.const(0),
-                    elem_size=_get_sizeof(arg_var.nameToken),
-                    heap_state=HeapStateDomain.allocated(),
-                    is_null_terminated=FlatDomain.top(),
-                )
-                state = state.set_buffer(name, info)
-
-        return state
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 6 — SCOPE-ESCAPE CHECKER (CWE-562, returning stack address)
-# ═══════════════════════════════════════════════════════════════════════════
-
-class ScopeEscapeChecker:
-    """
-    Detects cases where a pointer to a stack-local variable escapes
-    the function (e.g., returning &local_var). While not strictly a
-    memory-safety CWE in the buffer-overflow family, this directly
-    leads to use-after-free of stack memory.
-    """
-
-    def __init__(self, collector: DiagnosticCollector) -> None:
-        self._collector = collector
-
-    def check_return(self, return_token, state: MemState) -> None:
-        """Check if a return statement returns a pointer to stack memory."""
-        if return_token is None:
-            return
-        ret_expr = getattr(return_token, "astOperand1", None)
-        if ret_expr is None:
             return
 
-        # Check if returning address-of local
-        if getattr(ret_expr, "str", "") == "&":
-            operand = getattr(ret_expr, "astOperand1", None)
-            if operand and hasattr(operand, "variable") and operand.variable:
-                var = operand.variable
-                if getattr(var, "isLocal", False) and not getattr(var, "isStatic", False):
-                    self._collector.report(
-                        return_token,
-                        Severity.ERROR,
-                        f"Returning address of local variable "
-                        f"'{var.nameToken.str}' — dangling pointer",
-                        cwe=562,
-                        check_id="return-stack-addr",
-                    )
-                    return
-
-        # Check if returning a variable known to point to stack memory
-        var_name = _get_var_name(ret_expr)
-        if var_name:
-            buf = state.get_buffer(var_name)
-            if buf.heap_state.state == HeapState.STACK_LOCAL:
-                self._collector.report(
-                    return_token,
-                    Severity.ERROR,
-                    f"Returning '{var_name}' which points to stack-allocated memory "
-                    f"— dangling pointer after function returns",
-                    cwe=562,
-                    check_id="return-stack-ptr",
-                )
-
-            if buf.heap_state.state == HeapState.FREED:
-                self._collector.report(
-                    return_token,
-                    Severity.ERROR,
-                    f"Returning '{var_name}' which was already freed",
-                    cwe=416,
-                    check_id="return-freed-ptr",
-                )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 7 — NULL-CHECK ELISION DETECTOR
-# ═══════════════════════════════════════════════════════════════════════════
-
-class MallocNullCheckDetector:
-    """
-    Detects cases where the return value of malloc/calloc/realloc is
-    used without checking for NULL. This is CWE-476 (null pointer
-    dereference) specific to allocation failure paths.
-
-    Strategy:
-      After an allocation p = malloc(...), check if p is tested against
-      NULL before being dereferenced. We use dominator analysis: if the
-      dereference block is NOT dominated by a null-check block, report.
-    """
-
-    def __init__(self, collector: DiagnosticCollector) -> None:
-        self._collector = collector
-
-    def check_function(self, cfg: CFG, dom) -> None:
-        """
-        Scan the CFG for allocation sites and verify that each one
-        has a null check before any use.
-        """
-        alloc_sites: List[Tuple[Any, str, BasicBlock]
-                          ] = []  # (token, var_name, block)
-        # (token, var_name, block)
-        deref_sites: List[Tuple[Any, str, BasicBlock]] = []
-        # var_name → blocks
-        null_check_blocks: Dict[str, Set[BasicBlock]] = {}
-
-        for block in cfg.blocks:
-            for token in block.tokens:
-                tok_str = getattr(token, "str", "")
-
-                # Find allocation sites
-                if tok_str == "=" and hasattr(token, "isAssignmentOp") and token.isAssignmentOp:
-                    rhs = getattr(token, "astOperand2", None)
-                    func_name = _find_function_call(rhs) if rhs else None
-                    if func_name in _ALLOC_FUNCS:
-                        lhs = getattr(token, "astOperand1", None)
-                        var_name = _get_var_name(lhs)
-                        if var_name:
-                            alloc_sites.append((token, var_name, block))
-
-                # Find null checks: if (p) or if (p != NULL)
-                if tok_str in ("!=", "=="):
-                    op1 = getattr(token, "astOperand1", None)
-                    op2 = getattr(token, "astOperand2", None)
-                    var_name = None
-                    if op2 and getattr(op2, "str", "") == "0":
-                        var_name = _get_var_name(op1)
-                    elif op1 and getattr(op1, "str", "") == "0":
-                        var_name = _get_var_name(op2)
-                    if var_name:
-                        null_check_blocks.setdefault(
-                            var_name, set()).add(block)
-
-                # Find dereferences
-                if tok_str == "[" or tok_str == ".":
-                    base = getattr(token, "astOperand1", None)
-                    var_name = _get_var_name(base)
-                    if var_name:
-                        deref_sites.append((token, var_name, block))
-                if tok_str == "*":
-                    operand = getattr(token, "astOperand1", None)
-                    is_unary = (
-                        operand is not None
-                        and getattr(token, "astOperand2", None) is None
-                    )
-                    if is_unary:
-                        var_name = _get_var_name(operand)
-                        if var_name:
-                            deref_sites.append((token, var_name, block))
-
-        # For each allocation, check if there's a null check before use
-        for alloc_tok, alloc_var, alloc_block in alloc_sites:
-            check_blocks = null_check_blocks.get(alloc_var, set())
-            if not check_blocks:
-                # No null check anywhere — find first dereference
-                for deref_tok, deref_var, deref_block in deref_sites:
-                    if deref_var == alloc_var:
-                        # Check if alloc dominates deref (the deref is
-                        # reachable from alloc without a check)
-                        if dom.dominates(alloc_block, deref_block):
-                            # Check that no null-check block is between them
-                            has_check = False
-                            for cb in check_blocks:
-                                if (dom.dominates(alloc_block, cb)
-                                        and dom.dominates(cb, deref_block)):
-                                    has_check = True
-                                    break
-                            if not has_check:
-                                self._collector.report(
-                                    deref_tok,
-                                    Severity.WARNING,
-                                    f"'{alloc_var}' is used without NULL check after "
-                                    f"allocation at line "
-                                    f"{getattr(alloc_tok, 'linenr', '?')}",
-                                    cwe=476,
-                                    check_id="alloc-no-null-check",
-                                )
-                                break  # Report only the first dereference
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 8 — INTERPROCEDURAL SUMMARY FRAMEWORK
-# ═══════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class FunctionSummary:
-    """
-    Summary of a function's effect on memory safety.
-
-    Tracks:
-      - Which arguments are freed
-      - Which arguments must be non-null
-      - Which arguments must have minimum sizes
-      - Whether the return value is heap-allocated
-      - Whether the return value may be null
-    """
-    frees_args: Set[int] = field(default_factory=set)
-    requires_nonnull: Set[int] = field(default_factory=set)
-    min_arg_sizes: Dict[int, IntervalDomain] = field(default_factory=dict)
-    returns_heap: bool = False
-    return_may_be_null: bool = False
-    return_size_from_arg: Optional[int] = None  # arg index providing size
-
-
-# Pre-built summaries for standard library functions
-_STDLIB_SUMMARIES: Dict[str, FunctionSummary] = {
-    "malloc": FunctionSummary(
-        returns_heap=True,
-        return_may_be_null=True,
-        return_size_from_arg=0,
-    ),
-    "calloc": FunctionSummary(
-        returns_heap=True,
-        return_may_be_null=True,
-    ),
-    "realloc": FunctionSummary(
-        frees_args={0},  # may free the old pointer
-        returns_heap=True,
-        return_may_be_null=True,
-        return_size_from_arg=1,
-    ),
-    "free": FunctionSummary(
-        frees_args={0},
-    ),
-    "memcpy": FunctionSummary(
-        requires_nonnull={0, 1},
-    ),
-    "memmove": FunctionSummary(
-        requires_nonnull={0, 1},
-    ),
-    "memset": FunctionSummary(
-        requires_nonnull={0},
-    ),
-    "strcpy": FunctionSummary(
-        requires_nonnull={0, 1},
-    ),
-    "strncpy": FunctionSummary(
-        requires_nonnull={0, 1},
-    ),
-    "strcat": FunctionSummary(
-        requires_nonnull={0, 1},
-    ),
-    "strlen": FunctionSummary(
-        requires_nonnull={0},
-    ),
-    "strcmp": FunctionSummary(
-        requires_nonnull={0, 1},
-    ),
-    "printf": FunctionSummary(),
-    "fprintf": FunctionSummary(),
-    "sprintf": FunctionSummary(
-        requires_nonnull={0},
-    ),
-    "snprintf": FunctionSummary(
-        requires_nonnull={0},
-    ),
-}
-
-
-class SummaryApplicator:
-    """
-    Applies function summaries at call sites to refine the abstract state
-    and detect violations.
-    """
-
-    def __init__(self, collector: DiagnosticCollector) -> None:
-        self._collector = collector
-        self._summaries: Dict[str, FunctionSummary] = dict(_STDLIB_SUMMARIES)
-
-    def add_summary(self, func_name: str, summary: FunctionSummary) -> None:
-        self._summaries[func_name] = summary
-
-    def apply_at_call(
-        self, call_token, func_name: str, args: List, state: MemState
-    ) -> MemState:
-        """Apply a function summary at a call site."""
-        summary = self._summaries.get(func_name)
-        if summary is None:
-            return state
-
-        # Check non-null requirements
-        for arg_idx in summary.requires_nonnull:
-            if arg_idx < len(args):
-                var_name = _get_var_name(args[arg_idx])
-                if var_name:
-                    buf = state.get_buffer(var_name)
-                    if buf.heap_state.state == HeapState.NULL:
-                        self._collector.report(
-                            call_token,
-                            Severity.ERROR,
-                            f"{func_name}(): argument {arg_idx + 1} ('{var_name}') "
-                            f"is NULL but must be non-null",
-                            cwe=476,
-                            check_id="null-arg-to-nonnull",
-                        )
-                    elif buf.heap_state.state == HeapState.FREED:
-                        self._collector.report(
-                            call_token,
-                            Severity.ERROR,
-                            f"{func_name}(): argument {arg_idx + 1} ('{var_name}') "
-                            f"was freed — use after free",
-                            cwe=416,
-                            check_id="freed-arg-to-func",
-                        )
-
-        # Apply frees
-        for arg_idx in summary.frees_args:
-            if arg_idx < len(args):
-                var_name = _get_var_name(args[arg_idx])
-                if var_name:
-                    buf = state.get_buffer(var_name)
-                    state = state.set_buffer(var_name, buf.with_freed())
-
-        return state
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 9 — MAIN ANALYSIS DRIVER
-# ═══════════════════════════════════════════════════════════════════════════
-
-class BuflintAnalyzer:
-    """
-    Top-level analyzer that orchestrates all memory-safety checks.
-
-    Architecture:
-      1. Parse dump file
-      2. Build CFGs for all functions
-      3. Build call graph
-      4. For each function (in bottom-up call graph order):
-         a. Initialize abstract state from declarations
-         b. Run forward dataflow analysis (MemSafetyAnalysis)
-         c. Run scope-escape checks
-         d. Run malloc null-check detection
-         e. Apply interprocedural summaries
-      5. Collect and report all diagnostics
-    """
-
-    def __init__(self) -> None:
-        self._collector = DiagnosticCollector()
-        self._summary_applicator = SummaryApplicator(self._collector)
-
-    def analyze_dump(self, dump_path: str) -> List[Diagnostic]:
-        """Analyze a Cppcheck dump file and return diagnostics."""
-        data = cppcheckdata.parsedump(dump_path)
-
-        for config in data.configurations:
-            self._analyze_configuration(config)
-
-        return self._collector.diagnostics
-
-    def _analyze_configuration(self, config) -> None:
-        """Analyze a single configuration."""
-        # ── Step 1: Build CFGs ────────────────────────────────────────
-        cfg_builder = CFGBuilder()
-        try:
-            cfgs = cfg_builder.build_all(config)
-        except Exception:
-            # Fallback: analyze token-by-token without CFG
-            self._analyze_tokenlist_fallback(config)
+        vid = _var_id(lhs)
+        if not vid:
             return
 
-        # ── Step 2: Build call graph ──────────────────────────────────
-        cg_builder = CallGraphBuilder()
-        try:
-            call_graph = cg_builder.build(config)
-            analysis_order = call_graph.topological_order()
-            func_names = [getattr(f, "name", str(f)) for f in analysis_order]
-        except Exception:
-            func_names = list(cfgs.keys())
-
-        # ── Step 3: Analyze each function ─────────────────────────────
-        for func_name in func_names:
-            if func_name not in cfgs:
-                continue
-            cfg = cfgs[func_name]
-            self._analyze_function(func_name, cfg, config)
-
-    def _analyze_function(self, func_name: str, cfg: CFG, config) -> None:
-        """Run all analyses on a single function."""
-
-        # ── Initialize state from declarations ────────────────────────
-        initial_state = MemState.bottom()
-
-        # Find the function's scope to get variable declarations
-        func_obj = None
-        for func in getattr(config, "functions", []):
-            if getattr(func, "name", "") == func_name:
-                func_obj = func
-                break
-
-        if func_obj is not None:
-            # Scan function arguments
-            initial_state = VarDeclScanner.scan_function_args(
-                func_obj, initial_state
+        # Before assigning, check if old value leaks
+        old = self.env.get(vid)
+        if old and old.state == AllocState.ALLOCATED:
+            self.reporter.report(
+                tok, "warning",
+                f"Pointer '{_s(lhs)}' reassigned without free "
+                f"(allocated at line {getattr(old.alloc_tok, 'linenr', '?')})",
+                cwe=401, check_id="memoryLeak",
             )
 
-        # Scan local variable declarations from the entry block
-        if cfg.entry and cfg.entry.tokens:
-            scope = getattr(cfg.entry.tokens[0], "scope", None)
-            if scope:
-                initial_state = VarDeclScanner.scan_function_scope(
-                    scope, initial_state
+        rhs_s = _s(rhs)
+
+        # p = NULL / 0 / nullptr
+        if rhs_s in ("NULL", "nullptr") or (rhs_s == "0" and not getattr(rhs, "astOperand1", None)):
+            self.env[vid] = PtrInfo(state=AllocState.NULL)
+            return
+
+        # p = malloc(...)  — rhs is the '(' of the call, astOperand1 = func name
+        if rhs_s == "(":
+            fname = _s(getattr(rhs, "astOperand1", None))
+            if fname in ("malloc", "calloc", "strdup", "strndup",
+                         "aligned_alloc", "realloc"):
+                func_tok = getattr(rhs, "astOperand1", None)
+                sz = _get_alloc_size(func_tok) if func_tok else None
+
+                # Check realloc(p, size) — self-assignment leak
+                if fname == "realloc":
+                    args = _get_call_args_from_paren(rhs)
+                    if args:
+                        old_vid = _var_id(args[0])
+                        if old_vid and old_vid == vid:
+                            self.reporter.report(
+                                tok, "warning",
+                                f"p = realloc(p, n) leaks if realloc fails. "
+                                f"Use a temporary.",
+                                cwe=401, check_id="reallocLeak",
+                            )
+
+                self.env[vid] = PtrInfo(
+                    state=AllocState.ALLOCATED,
+                    alloc_tok=tok,
+                    alloc_size=sz,
                 )
+                return
 
-        # ── Run forward dataflow analysis ─────────────────────────────
-        analysis = MemSafetyAnalysis(self._collector)
-
-        engine = DataflowEngine(
-            strategy=WorklistStrategy.REVERSE_POSTORDER,
-            max_iterations=5000,
-            use_widening=True,
-            widening_delay=3,
-            use_narrowing=True,
-            narrowing_iterations=2,
-            trace=False,
-        )
-
-        try:
-            result = engine.run(analysis, cfg)
-        except Exception:
-            # If the engine fails, fall back to single-pass analysis
-            self._single_pass_analysis(cfg, initial_state)
+        # p = &local / p = array_name / p = "literal"
+        if rhs_s == "&":
+            self.env[vid] = PtrInfo(state=AllocState.NON_HEAP)
+            return
+        if getattr(rhs, "isString", False):
+            self.env[vid] = PtrInfo(state=AllocState.NON_HEAP)
+            return
+        rhs_var = getattr(rhs, "variable", None)
+        if rhs_var and getattr(rhs_var, "isArray", False):
+            self.env[vid] = PtrInfo(state=AllocState.NON_HEAP)
             return
 
-        # ── Post-analysis checks ──────────────────────────────────────
-
-        # Scope escape checking (return statements)
-        scope_checker = ScopeEscapeChecker(self._collector)
-        for block in cfg.blocks:
-            out_state = result.out_state(block)
-            if out_state is None:
-                continue
-            for token in block.tokens:
-                if getattr(token, "str", "") == "return":
-                    scope_checker.check_return(token, out_state)
-
-        # Malloc null-check detection
-        try:
-            dom = compute_dominators(cfg)
-            null_checker = MallocNullCheckDetector(self._collector)
-            null_checker.check_function(cfg, dom)
-        except Exception:
-            pass  # Non-critical check — skip on failure
-
-        # ── Apply interprocedural summaries at call sites ─────────────
-        for block in cfg.blocks:
-            in_state = result.in_state(block)
-            if in_state is None:
-                continue
-            for token in block.tokens:
-                func_call = _find_function_call(token)
-                if func_call:
-                    args = _get_call_args(token)
-                    self._summary_applicator.apply_at_call(
-                        token, func_call, args, in_state
-                    )
-
-    def _single_pass_analysis(self, cfg: CFG, initial_state: MemState) -> None:
-        """Fallback: single forward pass without fixed-point iteration."""
-        analysis = MemSafetyAnalysis(self._collector)
-        state = initial_state
-        for block in cfg.blocks:
-            try:
-                state = analysis.transfer(block, state)
-            except Exception:
-                continue
-
-    def _analyze_tokenlist_fallback(self, config) -> None:
-        """
-        Fallback analysis when CFG construction fails.
-        Performs a single linear pass over the token list.
-        """
-        state = MemState.bottom()
-        analysis = MemSafetyAnalysis(self._collector)
-
-        for token in getattr(config, "tokenlist", []):
-            try:
-                state = analysis._transfer_token(token, state)
-            except Exception:
-                continue
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 10 — PATTERN-BASED CHECKS (LIGHTWEIGHT / SYNTACTIC)
-# ═══════════════════════════════════════════════════════════════════════════
-
-class PatternChecker:
-    """
-    Lightweight pattern-based checks that don't require dataflow analysis.
-    These catch common coding mistakes with high confidence and zero
-    false positives.
-    """
-
-    def __init__(self, collector: DiagnosticCollector) -> None:
-        self._collector = collector
-
-    def check_tokenlist(self, tokenlist) -> None:
-        """Run all pattern checks on a token list."""
-        token = tokenlist[0] if tokenlist else None
-        while token:
-            self._check_sizeof_pointer(token)
-            self._check_gets(token)
-            self._check_strcpy_overlap(token)
-            self._check_snprintf_size(token)
-            self._check_alloca_in_loop(token)
-            token = getattr(token, "next", None)
-
-    def _check_sizeof_pointer(self, token) -> None:
-        """
-        CWE-131: Detect sizeof(ptr) when sizeof(*ptr) or sizeof(type) was intended.
-        Pattern: malloc(sizeof(p)) where p is a pointer.
-        """
-        if not _is_function_call(token, "malloc"):
+        # p = q  (alias copy)
+        rhs_vid = _var_id(rhs)
+        if rhs_vid and rhs_vid in self.env:
+            src = self.env[rhs_vid]
+            self.env[vid] = PtrInfo(
+                state=src.state, alloc_tok=src.alloc_tok,
+                free_tok=src.free_tok, is_offset=src.is_offset,
+                alloc_size=src.alloc_size,
+            )
             return
-        args = _get_call_args(token)
+
+        # p = q + N  (offset)
+        if rhs_s in ("+", "-"):
+            base = getattr(rhs, "astOperand1", None)
+            bvid = _var_id(base)
+            if bvid and bvid in self.env:
+                src = self.env[bvid]
+                self.env[vid] = PtrInfo(
+                    state=src.state, alloc_tok=src.alloc_tok,
+                    free_tok=src.free_tok, is_offset=True,
+                    alloc_size=src.alloc_size,
+                )
+                return
+
+        # Unknown
+        self.env[vid] = PtrInfo(state=AllocState.UNKNOWN)
+
+    def _on_free(self, paren_tok: Any) -> None:
+        """
+        Handle free(p).
+        paren_tok is the '(' token.
+        AST:  '(' → astOperand1='free', astOperand2='p'
+        """
+        args = _get_call_args_from_paren(paren_tok)
         if not args:
             return
         arg = args[0]
-        # Check if arg is sizeof(ptr_variable)
-        if getattr(arg, "str", "") == "sizeof":
-            sizeof_arg = getattr(arg, "astOperand2", None)
-            if sizeof_arg and _token_is_pointer_type(sizeof_arg):
-                self._collector.report(
-                    token,
-                    Severity.WARNING,
-                    f"malloc(sizeof({sizeof_arg.str})): '{sizeof_arg.str}' is a pointer — "
-                    f"did you mean sizeof(*{sizeof_arg.str}) or sizeof(type)?",
-                    cwe=131,
-                    check_id="sizeof-pointer",
-                )
+        arg_vid = _var_id(arg)
 
-    def _check_gets(self, token) -> None:
-        """CWE-120/CWE-242: Detect use of gets()."""
-        if getattr(token, "str", "") == "gets":
-            next_tok = getattr(token, "next", None)
-            if next_tok and getattr(next_tok, "str", "") == "(":
-                self._collector.report(
-                    token,
-                    Severity.ERROR,
-                    "Use of gets() is inherently unsafe — always use fgets() instead",
-                    cwe=242,
-                    check_id="use-of-gets",
-                )
-
-    def _check_strcpy_overlap(self, token) -> None:
-        """
-        Detect strcpy(buf, buf + n) — overlapping source and destination.
-        This is undefined behavior.
-        """
-        if not _is_function_call(token, "strcpy"):
-            return
-        args = _get_call_args(token)
-        if len(args) < 2:
-            return
-        dst_name = _get_var_name(args[0])
-        # Check if source involves dst
-        src = args[1]
-        if getattr(src, "str", "") == "+":
-            base = getattr(src, "astOperand1", None)
-            if base and _get_var_name(base) == dst_name:
-                self._collector.report(
-                    token,
-                    Severity.ERROR,
-                    f"strcpy() with overlapping buffers: source overlaps "
-                    f"with destination '{dst_name}' — use memmove()",
-                    cwe=119,
-                    check_id="strcpy-overlap",
-                )
-
-    def _check_snprintf_size(self, token) -> None:
-        """
-        CWE-131: Detect snprintf(buf, sizeof(buf) - 1, ...) which
-        should be snprintf(buf, sizeof(buf), ...) since snprintf
-        already reserves space for the null terminator.
-        """
-        if not _is_function_call(token, "snprintf"):
-            return
-        args = _get_call_args(token)
-        if len(args) < 2:
-            return
-        size_arg = args[1]
-        if getattr(size_arg, "str", "") == "-":
-            lhs = getattr(size_arg, "astOperand1", None)
-            rhs = getattr(size_arg, "astOperand2", None)
-            if (lhs and getattr(lhs, "str", "") == "sizeof"
-                    and rhs and getattr(rhs, "str", "") == "1"):
-                self._collector.report(
-                    token,
-                    Severity.STYLE,
-                    "snprintf() already null-terminates — "
-                    "sizeof(buf) - 1 is likely off-by-one; use sizeof(buf)",
-                    cwe=131,
-                    check_id="snprintf-off-by-one",
-                )
-
-    def _check_alloca_in_loop(self, token) -> None:
-        """
-        Detect alloca() inside a loop — can cause stack overflow.
-        """
-        if getattr(token, "str", "") != "alloca":
-            return
-        next_tok = getattr(token, "next", None)
-        if not (next_tok and getattr(next_tok, "str", "") == "("):
-            return
-        # Walk up scopes to check for loop
-        scope = getattr(token, "scope", None)
-        while scope:
-            scope_type = getattr(scope, "type", "")
-            if scope_type in ("While", "For", "Do"):
-                self._collector.report(
-                    token,
-                    Severity.WARNING,
-                    "alloca() inside a loop — may cause stack overflow "
-                    "on large iteration counts",
-                    cwe=770,
-                    check_id="alloca-in-loop",
+        # free(stack_array) → CWE-590
+        arg_var = getattr(arg, "variable", None)
+        if arg_var:
+            if getattr(arg_var, "isArray", False) and getattr(arg_var, "isLocal", False):
+                self.reporter.report(
+                    paren_tok, "error",
+                    f"Freeing stack-allocated array '{_s(arg)}'",
+                    cwe=590, check_id="freeNonHeap",
                 )
                 return
-            scope = getattr(scope, "nestedIn", None)
+            if getattr(arg_var, "isGlobal", False):
+                self.reporter.report(
+                    paren_tok, "error",
+                    f"Freeing global variable '{_s(arg)}'",
+                    cwe=590, check_id="freeNonHeap",
+                )
+                return
+
+        if not arg_vid:
+            return
+
+        info = self.env.get(arg_vid)
+        if info is None:
+            # First encounter — just record as freed
+            self.env[arg_vid] = PtrInfo(state=AllocState.FREED, free_tok=paren_tok)
+            return
+
+        if info.state == AllocState.NON_HEAP:
+            self.reporter.report(
+                paren_tok, "error",
+                f"Freeing non-heap pointer '{_s(arg)}'",
+                cwe=590, check_id="freeNonHeap",
+            )
+            return
+
+        if info.state == AllocState.FREED:
+            prev = getattr(info.free_tok, "linenr", "?")
+            self.reporter.report(
+                paren_tok, "error",
+                f"Double free of '{_s(arg)}' (previously freed at line {prev})",
+                cwe=415, check_id="doubleFree",
+            )
+            return
+
+        if info.is_offset:
+            self.reporter.report(
+                paren_tok, "error",
+                f"Freeing offset pointer '{_s(arg)}' "
+                f"(not at start of allocation)",
+                cwe=761, check_id="freeOffsetPointer",
+            )
+
+        if info.state == AllocState.NULL:
+            return  # free(NULL) is valid
+
+        info.state = AllocState.FREED
+        info.free_tok = paren_tok
+
+    def _check_deref(self, tok: Any, target: Any) -> None:
+        """Check if target pointer is freed or null."""
+        if target is None:
+            return
+        vid = _var_id(target)
+        if not vid:
+            return
+        info = self.env.get(vid)
+        if info is None:
+            return
+
+        if info.state == AllocState.FREED:
+            fl = getattr(info.free_tok, "linenr", "?")
+            self.reporter.report(
+                tok, "error",
+                f"Use after free: '{_s(target)}' freed at line {fl}",
+                cwe=416, check_id="useAfterFree",
+            )
+        elif info.state == AllocState.NULL:
+            self.reporter.report(
+                tok, "error",
+                f"NULL pointer dereference: '{_s(target)}'",
+                cwe=476, check_id="nullDeref",
+            )
+
+    def _check_leaks(self, scope: Any) -> None:
+        """At function exit, check for allocated-but-not-freed pointers."""
+        body_end = getattr(scope, "bodyEnd", None)
+        if body_end is None:
+            return
+        for vid, info in self.env.items():
+            if info.state == AllocState.ALLOCATED:
+                al = getattr(info.alloc_tok, "linenr", "?")
+                self.reporter.report(
+                    body_end, "warning",
+                    f"Memory leak: allocation at line {al} not freed",
+                    cwe=401, check_id="memoryLeak",
+                )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SECTION 11 — CHECKER REGISTRATION AND MAIN ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  PASS 2 — PATTERN CHECKS (AST + token patterns)
+# ═══════════════════════════════════════════════════════════════════
 
-def run_buflint(dump_path: str, *, verbose: bool = False) -> List[Diagnostic]:
-    """
-    Main entry point: run all Buflint checks on a dump file.
+class PatternChecks:
+    """CWE-120, CWE-131, CWE-135, CWE-170."""
 
-    Parameters
-    ----------
-    dump_path : str
-        Path to a Cppcheck .dump file.
-    verbose : bool
-        If True, print progress information to stderr.
+    def __init__(self, reporter: Reporter) -> None:
+        self.reporter = reporter
 
-    Returns
-    -------
-    List[Diagnostic]
-        Sorted list of diagnostics found.
-    """
-    if verbose:
-        print(f"[buflint] Analyzing {dump_path}", file=sys.stderr)
+    def run(self, cfg_data: Any) -> None:
+        for tok in cfg_data.tokenlist:
+            s = _s(tok)
 
-    # ── Phase 1: Pattern-based checks (fast, zero FP) ────────────────
-    collector = DiagnosticCollector()
-    data = cppcheckdata.parsedump(dump_path)
+            # ── CWE-120: gets() ──
+            if s == "gets" and _s(getattr(tok, "next", None)) == "(":
+                self.reporter.report(
+                    tok, "error",
+                    "Use of gets() is always unsafe — use fgets()",
+                    cwe=120, check_id="dangerousGets",
+                )
 
-    pattern_checker = PatternChecker(collector)
-    for config in data.configurations:
-        tokenlist = getattr(config, "tokenlist", [])
-        if tokenlist:
-            pattern_checker.check_tokenlist(tokenlist)
+            # ── CWE-120: scanf %s without width ──
+            if s in ("scanf", "fscanf", "sscanf"):
+                self._check_scanf(tok)
 
-    if verbose:
-        print(
-            f"[buflint] Pattern checks: {len(collector.diagnostics)} findings",
-            file=sys.stderr,
-        )
+            # ── CWE-131 / CWE-135 / CWE-170: alloc + string patterns ──
+            # Detect via the '(' of malloc/calloc call
+            if s == "(" and _s(getattr(tok, "astOperand1", None)) in ("malloc", "calloc"):
+                self._check_alloc_size_patterns(tok)
 
-    # ── Phase 2: Dataflow-based checks (sound, low FP) ───────────────
-    analyzer = BuflintAnalyzer()
-    # Share the collector so pattern findings are included
-    analyzer._collector = collector
-    analyzer._summary_applicator = SummaryApplicator(collector)
+            # ── CWE-170: strncpy without null termination ──
+            if s == "strncpy" and _s(getattr(tok, "next", None)) == "(":
+                self._check_strncpy(tok)
 
-    for config in data.configurations:
-        analyzer._analyze_configuration(config)
+    def _check_scanf(self, tok: Any) -> None:
+        nxt = getattr(tok, "next", None)
+        if nxt is None or _s(nxt) != "(":
+            return
 
-    if verbose:
-        print(
-            f"[buflint] Total findings: {len(collector.diagnostics)}",
-            file=sys.stderr,
-        )
+        # Find the format string token
+        args = _get_call_args_from_paren(nxt)
+        # For scanf: first arg is fmt; for fscanf/sscanf: second arg
+        fmt_idx = 0 if _s(tok) == "scanf" else 1
+        if fmt_idx >= len(args):
+            return
 
-    return collector.diagnostics
+        fmt_tok = args[fmt_idx]
+        if not getattr(fmt_tok, "isString", False):
+            return
+
+        fmt_str = _s(fmt_tok).strip('"')
+        # Find %s without width limiter (i.e. %s not %20s, not %*s)
+        if re.search(r'%(?!\d)(?!\*)s', fmt_str):
+            self.reporter.report(
+                tok, "warning",
+                f"'{_s(tok)}' with '%s' without width limit",
+                cwe=120, check_id="scanfNoWidth",
+            )
+
+    def _check_alloc_size_patterns(self, paren_tok: Any) -> None:
+        """
+        paren_tok is '(' of malloc/calloc call.
+        Check if the size argument is strlen(s) without +1.
+        """
+        arg_root = getattr(paren_tok, "astOperand2", None)
+        if arg_root is None:
+            return
+
+        func_name = _s(getattr(paren_tok, "astOperand1", None))
+
+        # For calloc, the size expression is the product — check both args
+        # For malloc, arg_root is the single argument
+        if self._has_strlen_without_plus1(arg_root):
+            self.reporter.report(
+                paren_tok, "warning",
+                "Allocation uses strlen() without +1 for null terminator",
+                cwe=131, check_id="strlenNoPlusOne",
+            )
+
+        if self._has_wcslen_without_sizeof_wchar(arg_root):
+            self.reporter.report(
+                paren_tok, "warning",
+                "Wide-string allocation uses wcslen() without "
+                "sizeof(wchar_t)",
+                cwe=135, check_id="wcslenSizeof",
+            )
+
+    def _has_strlen_without_plus1(self, tok: Any) -> bool:
+        """Check if AST contains strlen() not wrapped in strlen()+1."""
+        if tok is None:
+            return False
+        s = _s(tok)
+
+        # If this node is '+' with one side being strlen and other being 1 → OK
+        if s == "+":
+            op1 = getattr(tok, "astOperand1", None)
+            op2 = getattr(tok, "astOperand2", None)
+            if self._is_strlen_expr(op1) and _try_eval(op2) == 1:
+                return False
+            if self._is_strlen_expr(op2) and _try_eval(op1) == 1:
+                return False
+            # Both strlen → missing +1 for concatenation
+            if self._is_strlen_expr(op1) and self._is_strlen_expr(op2):
+                return True
+            # One is strlen, other is not 1
+            if self._is_strlen_expr(op1) or self._is_strlen_expr(op2):
+                return True
+
+        # Direct strlen call as entire argument
+        if self._is_strlen_expr(tok):
+            return True
+
+        # strlen * sizeof(char) — still missing +1
+        if s == "*":
+            op1 = getattr(tok, "astOperand1", None)
+            op2 = getattr(tok, "astOperand2", None)
+            if self._is_strlen_expr(op1) or self._is_strlen_expr(op2):
+                return True
+
+        return False
+
+    def _is_strlen_expr(self, tok: Any) -> bool:
+        """Is this tok a call to strlen (possibly wrapped in '(')?"""
+        if tok is None:
+            return False
+        s = _s(tok)
+        if s == "strlen":
+            return True
+        # AST: '(' with astOperand1 = 'strlen'
+        if s == "(":
+            return _s(getattr(tok, "astOperand1", None)) == "strlen"
+        return False
+
+    def _has_wcslen_without_sizeof_wchar(self, tok: Any) -> bool:
+        if tok is None:
+            return False
+        s = _s(tok)
+
+        is_wcslen = self._is_wcslen_expr(tok)
+        if is_wcslen:
+            return True  # bare wcslen with no multiplication
+
+        if s == "*":
+            op1 = getattr(tok, "astOperand1", None)
+            op2 = getattr(tok, "astOperand2", None)
+            has_wcs = self._is_wcslen_expr(op1) or self._is_wcslen_expr(op2)
+            if not has_wcs:
+                return False
+            other = op2 if self._is_wcslen_expr(op1) else op1
+            # Check if other is sizeof(wchar_t) — value should be 4 usually
+            v = _try_eval(other)
+            if v is not None and v >= 4:
+                return False  # probably sizeof(wchar_t)
+            return True
+
+        return False
+
+    def _is_wcslen_expr(self, tok: Any) -> bool:
+        if tok is None:
+            return False
+        if _s(tok) == "wcslen":
+            return True
+        if _s(tok) == "(":
+            return _s(getattr(tok, "astOperand1", None)) == "wcslen"
+        return False
+
+    def _check_strncpy(self, tok: Any) -> None:
+        """Detect strncpy without subsequent null termination."""
+        nxt = getattr(tok, "next", None)
+        if not nxt:
+            return
+        args = _get_call_args_from_paren(nxt)
+        if not args:
+            return
+
+        dst_tok = args[0]
+        dst_name = _s(dst_tok)
+        if not dst_name:
+            return
+
+        # Look ahead up to 30 tokens for  dst[...] = '\0' / 0
+        t = tok
+        found = False
+        for _ in range(40):
+            t = getattr(t, "next", None)
+            if t is None:
+                break
+            ts = _s(t)
+            if ts == "}" or ts == "return":
+                break
+            # dst [ ... ] = 0 / '\0'
+            if ts == dst_name:
+                n1 = getattr(t, "next", None)
+                if n1 and _s(n1) == "[":
+                    link = getattr(n1, "link", None)
+                    if link:
+                        eq = getattr(link, "next", None)
+                        if eq and _s(eq) == "=":
+                            val = getattr(eq, "next", None)
+                            if val and _s(val) in ("0", "'\\0'"):
+                                found = True
+                                break
+
+        if not found:
+            self.reporter.report(
+                tok, "warning",
+                f"strncpy to '{dst_name}' without explicit null "
+                f"termination — may not be null-terminated",
+                cwe=170, check_id="strncpyNoNullTerm",
+            )
 
 
-def main() -> int:
+# ═══════════════════════════════════════════════════════════════════
+#  PASS 3 — BOUNDS ANALYSIS
+# ═══════════════════════════════════════════════════════════════════
+
+class BoundsAnalysis:
+    """CWE-121/122/124/126/127/787/805."""
+
+    WRITE_FUNCS: Dict[str, Tuple[int, int]] = {
+        # func_name: (dst_arg_idx, size_arg_idx)
+        "memcpy":  (0, 2),
+        "memmove": (0, 2),
+        "memset":  (0, 2),
+        "strncpy": (0, 2),
+        "strncat": (0, 2),
+    }
+
+    def __init__(self, reporter: Reporter,
+                 mem_env: Dict[int, PtrInfo]) -> None:
+        self.reporter = reporter
+        self.mem_env = mem_env
+
+    def run(self, cfg_data: Any) -> None:
+        for tok in cfg_data.tokenlist:
+            s = _s(tok)
+
+            # Array subscript  a[i]
+            if s == "[" and getattr(tok, "astOperand1", None):
+                self._check_subscript(tok)
+
+            # Memory write functions
+            if s == "(" and _s(getattr(tok, "astOperand1", None)) in self.WRITE_FUNCS:
+                self._check_memfunc(tok)
+
+    def _check_subscript(self, tok: Any) -> None:
+        arr = getattr(tok, "astOperand1", None)
+        idx_tok = getattr(tok, "astOperand2", None)
+        if arr is None or idx_tok is None:
+            return
+
+        buf_size = self._buf_size(arr)
+        if buf_size is None:
+            return
+
+        # Collect possible index values
+        indices: List[int] = []
+        v = _try_eval(idx_tok)
+        if v is not None:
+            indices.append(v)
+        else:
+            for val in (getattr(idx_tok, "values", None) or []):
+                iv = getattr(val, "intvalue", None)
+                if iv is not None:
+                    indices.append(int(iv))
+
+        if not indices:
+            return
+
+        is_write = self._is_write(tok)
+        is_heap = self._is_heap(arr)
+
+        for idx in indices:
+            if idx < 0:
+                cwe = 124 if is_write else 127
+                tag = "Underwrite" if is_write else "Underread"
+                self.reporter.report(
+                    tok, "error",
+                    f"Buffer {tag.lower()}: '{_s(arr)}[{idx}]' "
+                    f"— negative index",
+                    cwe=cwe, check_id=f"buffer{tag}",
+                )
+            elif idx >= buf_size:
+                if is_write:
+                    cwe = 122 if is_heap else 121
+                    kind = "Heap" if is_heap else "Stack"
+                    self.reporter.report(
+                        tok, "error",
+                        f"{kind} buffer overflow: '{_s(arr)}[{idx}]' "
+                        f"exceeds size {buf_size}",
+                        cwe=cwe, check_id="bufferOverflow",
+                    )
+                else:
+                    self.reporter.report(
+                        tok, "warning",
+                        f"Buffer over-read: '{_s(arr)}[{idx}]' "
+                        f"exceeds size {buf_size}",
+                        cwe=126, check_id="bufferOverread",
+                    )
+
+    def _check_memfunc(self, paren_tok: Any) -> None:
+        fname = _s(getattr(paren_tok, "astOperand1", None))
+        info = self.WRITE_FUNCS.get(fname)
+        if info is None:
+            return
+
+        dst_idx, size_idx = info
+        args = _get_call_args_from_paren(paren_tok)
+        if dst_idx >= len(args) or size_idx >= len(args):
+            return
+
+        dst = args[dst_idx]
+        size_tok = args[size_idx]
+
+        dst_bytes = self._buf_size_bytes(dst)
+        copy_size = _try_eval(size_tok)
+
+        if dst_bytes is not None and copy_size is not None and copy_size > dst_bytes:
+            self.reporter.report(
+                paren_tok, "error",
+                f"'{fname}' writes {copy_size} bytes into "
+                f"'{_s(dst)}' of {dst_bytes} bytes",
+                cwe=805, check_id="bufferAccessIncorrectLength",
+            )
+
+    # -- helpers --
+
+    def _buf_size(self, tok: Any) -> Optional[int]:
+        """Size in elements."""
+        var = getattr(tok, "variable", None)
+        dim = _get_array_dimension(var)
+        if dim is not None:
+            return dim
+
+        vid = _var_id(tok)
+        if vid and vid in self.mem_env:
+            info = self.mem_env[vid]
+            if info.alloc_size is not None:
+                esz = _get_element_size_from_var(var) if var else 1
+                return info.alloc_size // max(esz, 1)
+
+        return None
+
+    def _buf_size_bytes(self, tok: Any) -> Optional[int]:
+        var = getattr(tok, "variable", None)
+        dim = _get_array_dimension(var)
+        if dim is not None:
+            esz = _get_element_size_from_var(var) if var else 1
+            return dim * esz
+
+        vid = _var_id(tok)
+        if vid and vid in self.mem_env:
+            info = self.mem_env[vid]
+            return info.alloc_size
+
+        return None
+
+    def _is_heap(self, tok: Any) -> bool:
+        vid = _var_id(tok)
+        if vid and vid in self.mem_env:
+            return self.mem_env[vid].state in (AllocState.ALLOCATED,
+                                                AllocState.FREED)
+        var = getattr(tok, "variable", None)
+        if var:
+            return getattr(var, "isPointer", False) and not getattr(var, "isArray", False)
+        return False
+
+    def _is_write(self, bracket_tok: Any) -> bool:
+        """Is this subscript on the LHS of an assignment?"""
+        parent = getattr(bracket_tok, "astParent", None)
+        if parent is None:
+            return False
+        ps = _s(parent)
+        if ps in ("=", "+=", "-=", "*=", "/=", "%=",
+                   "|=", "&=", "^=", "<<=", ">>="):
+            return getattr(parent, "astOperand1", None) is bracket_tok
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PASS 4 — NULL CHECK AFTER ALLOCATION
+# ═══════════════════════════════════════════════════════════════════
+
+class NullCheckAnalysis:
+    """CWE-476: dereference of pointer from malloc without NULL check."""
+
+    def __init__(self, reporter: Reporter) -> None:
+        self.reporter = reporter
+
+    def run(self, cfg_data: Any) -> None:
+        unchecked: Dict[int, Any] = {}  # var_id → alloc_token
+
+        for tok in cfg_data.tokenlist:
+            s = _s(tok)
+
+            # ── Assignment from allocator ──
+            if s == "=":
+                lhs = getattr(tok, "astOperand1", None)
+                rhs = getattr(tok, "astOperand2", None)
+                if lhs and rhs:
+                    vid = _var_id(lhs)
+                    if vid and _s(rhs) == "(":
+                        fname = _s(getattr(rhs, "astOperand1", None))
+                        if fname in ("malloc", "calloc", "realloc"):
+                            unchecked[vid] = tok
+
+            # ── NULL-check patterns ──
+            if s in ("!", "==", "!=", "if"):
+                self._absorb_check(tok, unchecked)
+
+            # ── Dereference ──
+            if s in ("*", "->"):
+                target = getattr(tok, "astOperand1", None)
+                vid = _var_id(target)
+                if vid and vid in unchecked:
+                    self.reporter.report(
+                        tok, "warning",
+                        f"Pointer '{_s(target)}' dereferenced without "
+                        f"NULL check after allocation",
+                        cwe=476, check_id="nullDerefAlloc",
+                    )
+                    del unchecked[vid]
+            if s == "[":
+                target = getattr(tok, "astOperand1", None)
+                vid = _var_id(target)
+                if vid and vid in unchecked:
+                    self.reporter.report(
+                        tok, "warning",
+                        f"Pointer '{_s(target)}' used without NULL check "
+                        f"after allocation",
+                        cwe=476, check_id="nullDerefAlloc",
+                    )
+                    del unchecked[vid]
+
+    def _absorb_check(self, tok: Any, unchecked: Dict[int, Any]) -> None:
+        """Remove from unchecked if the variable appears in a condition."""
+        for attr in ("astOperand1", "astOperand2"):
+            child = getattr(tok, attr, None)
+            if child:
+                vid = _var_id(child)
+                if vid and vid in unchecked:
+                    del unchecked[vid]
+                # One level deeper for patterns like if(p == NULL)
+                for attr2 in ("astOperand1", "astOperand2"):
+                    gc = getattr(child, attr2, None)
+                    if gc:
+                        vid2 = _var_id(gc)
+                        if vid2 and vid2 in unchecked:
+                            del unchecked[vid2]
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ORCHESTRATOR
+# ═══════════════════════════════════════════════════════════════════
+
+class BuflintChecker:
+    def __init__(self) -> None:
+        self.reporter = Reporter()
+
+    def check(self, data: Any) -> None:
+        for cfg_data in data.configurations:
+            mem = MemSafetyAnalysis(self.reporter)
+            mem.run(cfg_data)
+
+            PatternChecks(self.reporter).run(cfg_data)
+            BoundsAnalysis(self.reporter, mem.env).run(cfg_data)
+            NullCheckAnalysis(self.reporter).run(cfg_data)
+
+    def report(self) -> int:
+        self.reporter.dump()
+        return len(self.reporter.findings)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ENTRY POINTS
+# ═══════════════════════════════════════════════════════════════════
+
+def check(data: Any) -> None:
+    """Cppcheck addon entry point."""
+    checker = BuflintChecker()
+    checker.check(data)
+    count = checker.report()
+    if count > 0:
+        sys.exit(1)
+
+
+def main() -> None:
     """CLI entry point."""
-    parser = argparse.ArgumentParser(
-        prog="buflint",
-        description=(
-            "Buflint — Sound memory-safety static analyzer for C/C++ "
-            "(Cppcheck addon)"
-        ),
-    )
-    parser.add_argument(
-        "dump_files",
-        nargs="+",
-        metavar="FILE.dump",
-        help="Cppcheck dump file(s) to analyze",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Print progress information to stderr",
-    )
-    parser.add_argument(
-        "--exit-code",
-        type=int,
-        default=1,
-        metavar="N",
-        help="Exit code when findings are present (default: 1)",
-    )
-    parser.add_argument(
-        "--severity",
-        choices=["error", "warning", "style", "all"],
-        default="all",
-        help="Minimum severity to report (default: all)",
-    )
+    if len(sys.argv) < 2:
+        print("Usage: python buflint.py <dumpfile> [...]", file=sys.stderr)
+        sys.exit(2)
 
-    args = parser.parse_args()
-
-    severity_filter = {
-        "error": {Severity.ERROR},
-        "warning": {Severity.ERROR, Severity.WARNING},
-        "style": {Severity.ERROR, Severity.WARNING, Severity.STYLE},
-        "all": {Severity.ERROR, Severity.WARNING, Severity.STYLE, Severity.PORTABILITY},
-    }[args.severity]
-
-    total_findings = 0
-
-    for dump_path in args.dump_files:
-        if not os.path.isfile(dump_path):
-            print(
-                f"[buflint] Error: file not found: {dump_path}", file=sys.stderr)
+    total = 0
+    for path in sys.argv[1:]:
+        if path.startswith("-"):
             continue
+        try:
+            data = cppcheckdata.parsedump(path)
+        except Exception as e:
+            print(f"Error loading {path}: {e}", file=sys.stderr)
+            continue
+        checker = BuflintChecker()
+        checker.check(data)
+        total += checker.report()
 
-        diagnostics = run_buflint(dump_path, verbose=args.verbose)
-
-        for diag in diagnostics:
-            if diag.severity in severity_filter:
-                print(diag.cppcheck_format())
-                total_findings += 1
-
-    if args.verbose:
-        print(
-            f"\n[buflint] Grand total: {total_findings} finding(s) "
-            f"across {len(args.dump_files)} file(s)",
-            file=sys.stderr,
-        )
-
-    return args.exit_code if total_findings > 0 else 0
+    if total:
+        print(f"\nbuflint: {total} finding(s).", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print("buflint: no findings.", file=sys.stderr)
+        sys.exit(0)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
