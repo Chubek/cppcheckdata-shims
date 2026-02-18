@@ -468,7 +468,8 @@ class CheckerContext:
     stats        : mutable dict for timing / counting statistics
     """
     cfg: Any  # cppcheckdata.Configuration
-    suppressions: SuppressionManager = field(default_factory=SuppressionManager)
+    suppressions: SuppressionManager = field(
+        default_factory=SuppressionManager)
     analysis: Dict[str, Any] = field(default_factory=dict)
     options: Dict[str, Any] = field(default_factory=dict)
     stats: Dict[str, Any] = field(default_factory=dict)
@@ -734,7 +735,8 @@ class NullDerefChecker(Checker):
 
     def __init__(self) -> None:
         super().__init__()
-        self._null_sites: List[Tuple[Any, int, str]] = []  # (token, varId, reason)
+        # (token, varId, reason)
+        self._null_sites: List[Tuple[Any, int, str]] = []
 
     def collect_evidence(self, ctx: CheckerContext) -> None:
         cfg = ctx.cfg
@@ -848,7 +850,8 @@ class BufferOverflowChecker(Checker):
     def __init__(self) -> None:
         super().__init__()
         self._array_sizes: Dict[int, int] = {}  # varId → known size
-        self._violations: List[Tuple[Any, int, str, str]] = []  # (tok, varId, eid, msg)
+        # (tok, varId, eid, msg)
+        self._violations: List[Tuple[Any, int, str, str]] = []
 
     def collect_evidence(self, ctx: CheckerContext) -> None:
         cfg = ctx.cfg
@@ -939,7 +942,8 @@ class BufferOverflowChecker(Checker):
                 file=file, line=line, column=_tok_col(tok),
                 severity=DiagnosticSeverity.ERROR if is_definite else DiagnosticSeverity.WARNING,
                 confidence=Confidence.HIGH if is_definite else Confidence.MEDIUM,
-                evidence={"varId": vid, "arraySize": self._array_sizes.get(vid, -1)},
+                evidence={"varId": vid,
+                          "arraySize": self._array_sizes.get(vid, -1)},
             )
 
 
@@ -975,8 +979,10 @@ class UseAfterFreeChecker(Checker):
 
     def __init__(self) -> None:
         super().__init__()
-        self._free_sites: Dict[int, List[Any]] = defaultdict(list)  # varId → [free tokens]
-        self._use_after_free: List[Tuple[Any, Any, int]] = []  # (use_tok, free_tok, varId)
+        self._free_sites: Dict[int, List[Any]] = defaultdict(
+            list)  # varId → [free tokens]
+        # (use_tok, free_tok, varId)
+        self._use_after_free: List[Tuple[Any, Any, int]] = []
 
     def collect_evidence(self, ctx: CheckerContext) -> None:
         cfg = ctx.cfg
@@ -1243,7 +1249,8 @@ class DeadStoreChecker(Checker):
 
     def __init__(self) -> None:
         super().__init__()
-        self._dead_stores: List[Tuple[Any, int, bool]] = []  # (tok, varId, is_init)
+        # (tok, varId, is_init)
+        self._dead_stores: List[Tuple[Any, int, bool]] = []
 
     def collect_evidence(self, ctx: CheckerContext) -> None:
         cfg = ctx.cfg
@@ -1311,7 +1318,8 @@ class DeadStoreChecker(Checker):
                 tok = getattr(tok, "next", None)
 
             if not is_read:
-                is_init = _tok_str(assign_tok) == "=" and self._is_declaration_init(assign_tok)
+                is_init = _tok_str(
+                    assign_tok) == "=" and self._is_declaration_init(assign_tok)
                 self._dead_stores.append((assign_tok, vid, is_init))
 
     def _is_declaration_init(self, assign_tok: Any) -> bool:
@@ -1544,7 +1552,8 @@ class TaintInjectionChecker(Checker):
                 arg_dict = getattr(func, "argument", {})
                 if isinstance(arg_dict, dict) and 2 in arg_dict:
                     argv = arg_dict[2]
-                    argv_vid = getattr(argv, "Id", None) or getattr(argv, "varId", None)
+                    argv_vid = getattr(argv, "Id", None) or getattr(
+                        argv, "varId", None)
                     if argv_vid:
                         self._tainted_vars[int(argv_vid)] = None
 
@@ -1805,7 +1814,8 @@ class IntOverflowChecker(Checker):
 
             is_under = "underflow" in msg.lower()
             is_definite = confidence == Confidence.HIGH
-            eid = "intUnderflow" if is_under else ("intOverflow" if is_definite else "intOverflowPossible")
+            eid = "intUnderflow" if is_under else (
+                "intOverflow" if is_definite else "intOverflowPossible")
 
             self._emit(
                 error_id=eid,
@@ -1945,7 +1955,7 @@ class ResourceLeakChecker(Checker):
                             op1_str = _tok_str(op1)
                             # Storing through pointer or to struct field
                             if (getattr(op1, "astParent", None) and
-                                _tok_str(getattr(op1, "astParent", None)) in {".", "->", "*"}):
+                                    _tok_str(getattr(op1, "astParent", None)) in {".", "->", "*"}):
                                 self._escaped.add(vid)
                             # Storing to a non-local variable
                             op1_var = getattr(op1, "variable", None)
@@ -2632,6 +2642,16 @@ class CheckerRunner:
                     combined.checker_names.append(name)
         return combined
 
+    def run_all(self, cfg, data):
+        for checker_cls in get_registered_checkers():
+            checker = checker_cls(
+                addon_name=self.addon_name,
+                cli_mode=self.cli_mode,
+                template=self.template,
+                quiet=self.quiet,
+            )
+            checker.run(cfg, data)
+
 
 # ═════════════════════════════════════════════════════════════════════════
 #  PART 8 — CONVENIENCE ENTRY POINT FOR CPPCHECK ADDONS
@@ -2742,6 +2762,86 @@ def _main() -> None:
         suppress=args.suppress,
     )
     sys.exit(exit_code)
+
+
+def register_checker(cls: type) -> type:
+    """
+    Class decorator that registers a ``Checker`` subclass in the
+    global checker registry.
+
+    The decorator performs three validations at import time:
+
+    1. *cls* must be a subclass of ``Checker``.
+    2. *cls* must define a non-empty ``name`` attribute.
+    3. *cls* must not already be registered (guards against duplicate
+       imports / reloads).
+
+    Parameters
+    ----------
+    cls : type
+        A concrete ``Checker`` subclass.
+
+    Returns
+    -------
+    type
+        The same class, unmodified — this is a pure registration
+        side-effect decorator.
+
+    Raises
+    ------
+    TypeError
+        If *cls* is not a ``Checker`` subclass.
+    ValueError
+        If *cls* has no ``name`` or is already registered.
+
+    Examples
+    --------
+    >>> @register_checker
+    ... class DemoChecker(Checker):
+    ...     name = "demo.check"
+    ...     description = "A demo checker"
+    ...     def run(self, cfg, data):
+    ...         pass
+    >>> DemoChecker in _CHECKER_REGISTRY
+    True
+    """
+    if not (isinstance(cls, type) and issubclass(cls, Checker)):
+        raise TypeError(
+            f"@register_checker expects a Checker subclass, "
+            f"got {cls!r} (type={type(cls).__name__})"
+        )
+
+    checker_name = getattr(cls, "name", None)
+    if not checker_name:
+        raise ValueError(
+            f"Checker class {cls.__name__} must define a non-empty "
+            f"'name' class attribute before registration."
+        )
+
+    # Guard against double-registration (e.g. module reloaded).
+    if cls not in _CHECKER_REGISTRY:
+        _CHECKER_REGISTRY.append(cls)
+
+    return cls
+
+
+def get_registered_checkers() -> List[type]:
+    """
+    Return a shallow copy of the global checker registry.
+
+    This is the public API consumed by ``CheckerRunner.run_all()``.
+    """
+    return list(_CHECKER_REGISTRY)
+
+
+def clear_registry() -> None:
+    """
+    Clear the global checker registry.
+
+    Intended for test harnesses that need a clean slate between
+    test cases.
+    """
+    _CHECKER_REGISTRY.clear()
 
 
 if __name__ == "__main__":
