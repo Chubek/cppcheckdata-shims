@@ -2,15 +2,15 @@
 """
 Control-flow analysis for cppcheckdata-shims.
 
-This module provides analysis that reason about the *structure* of control
+This module provides analyses that reason about the *structure* of control
 flow—loops, paths, dominance, reachability—rather than propagating abstract
 data values (which is the job of dataflow_analysis.py).
 
-All analysis consume the CFG representation from ctrlflow_graph.py and
+All analyses consume the CFG representation from ctrlflow_graph.py and
 optionally exploit cppcheckdata.Configuration.ValueFlow for path-condition
 pruning, loop-bound estimation, and invariant detection.
 
-Principal analysis
+Principal analyses
 ------------------
 - DominatorTree / PostDominatorTree
 - NaturalLoopDetector
@@ -21,6 +21,14 @@ Principal analysis
 - PathFeasibilityChecker
 - BranchCorrelationAnalysis
 - UnreachableCodeDetector
+- ControlDependenceGraph       ← NEW: CDG (Ferrante–Ottenstein–Warren 1987)
+- IntervalAnalysis             ← NEW: T1/T2 intervals (Allen–Cocke)
+- StructuralAnalysis           ← NEW: region-based structural analysis
+- CyclomaticComplexityAnalyzer ← NEW: McCabe V(G) = E − N + 2P
+- StronglyConnectedComponents  ← NEW: Tarjan's SCC
+- CriticalEdgeDetector         ← NEW: critical-edge identification
+- LoopNestingForest            ← NEW: Ramalingam's loop-nesting forest
+- DefUseChainBuilder           ← NEW: per-variable def-use chains on CFG
 
 Usage example (loop-invariant warning)
 --------------------------------------
@@ -36,6 +44,20 @@ Usage example (loop-invariant warning)
     for inv in lia.invariants():
         print(f"{inv.file}:{inv.line}: style: expression '{inv.text}' "
               f"is loop-invariant and can be hoisted [loopInvariant]")
+
+References
+----------
+[1] Cooper, Harvey, Kennedy – "A Simple, Fast Dominance Algorithm", 2001.
+[2] Lengauer, Tarjan – "A Fast Algorithm for Finding Dominators …", 1979.
+[3] Aho, Lam, Sethi, Ullman – "Compilers: Principles, Techniques, &
+    Tools", 2e, §9.6 (natural loops), §9.7 (dominators).
+[4] Ferrante, Ottenstein, Warren – "The Program Dependence Graph …", 1987.
+[5] Allen, Cocke – "A Catalog of Optimizing Transformations", 1972.
+[6] Sharir – "Structural Analysis of Programs", 1980.
+[7] McCabe – "A Complexity Measure", IEEE TSE, 1976.
+[8] Tarjan – "Depth-First Search and Linear Graph Algorithms", 1972.
+[9] Ramalingam – "On Loops, Dominators, and Dominance Frontiers", 2002.
+[10] Cytron et al. – "Efficiently Computing SSA Form …", 1991.
 """
 
 from __future__ import annotations
@@ -49,7 +71,6 @@ from typing import (
     Mapping, Optional, Sequence, Set, Tuple, Union,
 )
 
-
 # ---------------------------------------------------------------------------
 # Type aliases for the CFG representation from ctrlflow_graph.py
 # ---------------------------------------------------------------------------
@@ -58,16 +79,17 @@ from typing import (
 #
 # A "CfgNode" must expose:
 #   .id            : int | str          — unique identifier
-#   .successors    : Sequence[CfgNode]
-#   .predecessors  : Sequence[CfgNode]
+#   .successors    : Sequence[CfgNode | CfgEdge]
+#   .predecessors  : Sequence[CfgNode | CfgEdge]
 #   .tokens        : Sequence[Token]    — cppcheckdata tokens in this block
-#   .is_entry      : bool
-#   .is_exit       : bool
+#   .is_entry      : bool               (optional)
+#   .is_exit       : bool               (optional)
 #
 # A "Cfg" must expose:
 #   .entry         : CfgNode
 #   .exit          : CfgNode
 #   .nodes         : Sequence[CfgNode]  — all nodes (blocks)
+#   .edges         : Sequence[CfgEdge]  (optional – for some new analyses)
 
 CfgNode = Any
 Cfg = Any
@@ -75,7 +97,6 @@ Token = Any
 Configuration = Any
 
 _SENTINEL = object()
-
 
 # ===================================================================
 #  Utility: node id extraction
@@ -94,15 +115,57 @@ def _node_tokens(node: CfgNode) -> List[Token]:
 
 
 def _successors(node: CfgNode) -> List[CfgNode]:
-    return list(getattr(node, "successors", []) or [])
+    """Get successor *nodes*, handling both edge objects and direct node refs.
+
+    ctrlflow_graph.CFGNode stores edges in .successors; each edge has .dst.
+    But lightweight test mocks may store nodes directly.
+    """
+    succs = getattr(node, "successors", []) or []
+    result: List[CfgNode] = []
+    for s in succs:
+        if hasattr(s, "dst"):
+            result.append(s.dst)
+        elif hasattr(s, "target"):
+            result.append(s.target)
+        else:
+            result.append(s)
+    return result
 
 
 def _predecessors(node: CfgNode) -> List[CfgNode]:
-    return list(getattr(node, "predecessors", []) or [])
+    """Get predecessor *nodes*, handling both edge objects and direct node refs."""
+    preds = getattr(node, "predecessors", []) or []
+    result: List[CfgNode] = []
+    for p in preds:
+        if hasattr(p, "src"):
+            result.append(p.src)
+        elif hasattr(p, "source"):
+            result.append(p.source)
+        else:
+            result.append(p)
+    return result
 
 
 def _all_nodes(cfg: Cfg) -> List[CfgNode]:
     return list(getattr(cfg, "nodes", []) or [])
+
+
+def _all_edges_raw(cfg: Cfg) -> List[Any]:
+    """Return the raw edge list from the CFG, or [] if not available."""
+    return list(getattr(cfg, "edges", []) or [])
+
+
+# ===================================================================
+# Helper: token id extraction
+# ===================================================================
+
+def _get_tok_id(tok: Any) -> Any:
+    """Extract a hashable id from a cppcheckdata token."""
+    if tok is None:
+        return None
+    if hasattr(tok, "Id"):
+        return tok.Id
+    return id(tok)
 
 
 # ===================================================================
@@ -116,11 +179,21 @@ class DominatorTree:
     For a CFG with *n* nodes this runs in O(n · α(n)) time, where
     α is the inverse Ackermann function (effectively linear).
 
+    The implementation uses the Cooper–Harvey–Kennedy iterative
+    algorithm [1], which is simple, correct, and fast enough for the
+    CFGs that cppcheck produces.
+
     Attributes after .compute():
-        idom            : Dict[node_id, node_id]  — immediate dominator
-        dom_frontier    : Dict[node_id, Set[node_id]]  — dominance frontier
+        idom              : Dict[node_id, node_id]  — immediate dominator
+        dom_frontier      : Dict[node_id, Set[node_id]]  — dominance frontier
         dom_tree_children : Dict[node_id, List[node_id]]
-        depth           : Dict[node_id, int]  — depth in the dominator tree
+        depth             : Dict[node_id, int]  — depth in the dominator tree
+
+    IMPORTANT — root convention
+    ---------------------------
+    The entry node's immediate dominator is set to *itself*
+    (``self.idom[entry_id] == entry_id``).  Every walk up the idom
+    chain **must** check for this self-loop to avoid infinite loops.
     """
 
     def __init__(self, cfg: Cfg):
@@ -147,46 +220,100 @@ class DominatorTree:
         return self
 
     def dominates(self, a_id: Any, b_id: Any) -> bool:
-        """Return True if *a* dominates *b* (a dom b)."""
+        """Return True if *a* dominates *b* (a dom b).
+
+        A node dominates itself.  The entry node dominates every node.
+        We walk up the immediate-dominator chain from *b*; the walk
+        terminates when we either find *a* or reach the root (a node
+        whose idom is itself).
+        """
         self.compute()
+        if a_id == b_id:
+            return True
         cur = b_id
+        visited: Set[Any] = set()
         while cur is not None:
             if cur == a_id:
                 return True
-            cur = self.idom.get(cur)
+            if cur in visited:
+                return False          # cycle – defensive
+            visited.add(cur)
+            idom_of_cur = self.idom.get(cur)
+            if idom_of_cur == cur:    # root of the dominator tree
+                return False
+            cur = idom_of_cur
         return False
 
     def strictly_dominates(self, a_id: Any, b_id: Any) -> bool:
+        """Return True if *a* strictly dominates *b*: a dom b and a ≠ b."""
         return a_id != b_id and self.dominates(a_id, b_id)
 
     def common_dominator(self, a_id: Any, b_id: Any) -> Optional[Any]:
         """Lowest common ancestor in the dominator tree."""
         self.compute()
+        # Collect ancestors of a
         a_anc: Set[Any] = set()
         cur = a_id
-        while cur is not None:
+        visited: Set[Any] = set()
+        while cur is not None and cur not in visited:
             a_anc.add(cur)
-            cur = self.idom.get(cur)
+            visited.add(cur)
+            idom_of_cur = self.idom.get(cur)
+            if idom_of_cur == cur:
+                break
+            cur = idom_of_cur
+        # Walk from b and find first hit
         cur = b_id
-        while cur is not None:
+        visited2: Set[Any] = set()
+        while cur is not None and cur not in visited2:
             if cur in a_anc:
                 return cur
-            cur = self.idom.get(cur)
+            visited2.add(cur)
+            idom_of_cur = self.idom.get(cur)
+            if idom_of_cur == cur:
+                if cur in a_anc:
+                    return cur
+                break
+            cur = idom_of_cur
         return None
 
+    def all_dominators(self, node_id: Any) -> Set[Any]:
+        """Return the set of all nodes that dominate *node_id* (including itself)."""
+        self.compute()
+        result: Set[Any] = set()
+        cur = node_id
+        visited: Set[Any] = set()
+        while cur is not None and cur not in visited:
+            result.add(cur)
+            visited.add(cur)
+            idom_of_cur = self.idom.get(cur)
+            if idom_of_cur == cur:
+                break
+            cur = idom_of_cur
+        return result
+
+    def subtree(self, root_id: Any) -> Set[Any]:
+        """Return all node ids in the dominator sub-tree rooted at *root_id*."""
+        self.compute()
+        result: Set[Any] = set()
+        q: Deque[Any] = deque([root_id])
+        while q:
+            nid = q.popleft()
+            if nid in result:
+                continue
+            result.add(nid)
+            for child in self.dom_tree_children.get(nid, []):
+                q.append(child)
+        return result
+
     # ---- internals: Cooper–Harvey–Kennedy iterative algorithm --------
-    # Simple, correct, and fast enough for the CFGs cppcheck produces.
 
     def _compute_idom(self):
         entry = self.cfg.entry
         entry_id = _nid(entry)
         nodes = self._nodes
 
-        # RPO numbering
-        rpo_order: List[Any] = []
-        visited: Set[Any] = set()
-        stack: List[CfgNode] = [entry]
-        # iterative DFS for RPO
+        # RPO numbering via iterative DFS
         finish_stack: List[Any] = []
         vis: Set[Any] = set()
 
@@ -211,22 +338,44 @@ class DominatorTree:
         rpo_order = list(reversed(finish_stack))
         rpo_num: Dict[Any, int] = {nid: i for i, nid in enumerate(rpo_order)}
 
-        # initialise idom
+        # Initialise idom: entry's idom is itself (sentinel for root)
         self.idom = {nid: None for nid in rpo_num}
         self.idom[entry_id] = entry_id
 
+        n_nodes = len(rpo_order)
+
         def _intersect(b1: Any, b2: Any) -> Any:
+            """Walk two fingers up the idom tree until they meet."""
             finger1, finger2 = b1, b2
-            while finger1 != finger2:
-                while rpo_num.get(finger1, len(rpo_order)) > rpo_num.get(finger2, len(rpo_order)):
-                    finger1 = self.idom.get(finger1, finger1)
-                while rpo_num.get(finger2, len(rpo_order)) > rpo_num.get(finger1, len(rpo_order)):
-                    finger2 = self.idom.get(finger2, finger2)
+            max_steps = n_nodes + 10
+            steps = 0
+            while finger1 != finger2 and steps < max_steps:
+                steps += 1
+                while (rpo_num.get(finger1, n_nodes)
+                       > rpo_num.get(finger2, n_nodes)):
+                    nxt = self.idom.get(finger1)
+                    if nxt is None or nxt == finger1:
+                        break
+                    finger1 = nxt
+                while (rpo_num.get(finger2, n_nodes)
+                       > rpo_num.get(finger1, n_nodes)):
+                    nxt = self.idom.get(finger2)
+                    if nxt is None or nxt == finger2:
+                        break
+                    finger2 = nxt
+                # Both at root?
+                if (self.idom.get(finger1) == finger1
+                        and self.idom.get(finger2) == finger2):
+                    break
             return finger1
 
+        # Iterative refinement until fixed point
         changed = True
-        while changed:
+        max_outer = n_nodes * 3 + 10
+        outer = 0
+        while changed and outer < max_outer:
             changed = False
+            outer += 1
             for nid in rpo_order:
                 if nid == entry_id:
                     continue
@@ -246,13 +395,13 @@ class DominatorTree:
                     changed = True
 
     def _build_dom_tree(self):
-        entry_id = _nid(self.cfg.entry)
         self.dom_tree_children = defaultdict(list)
         for nid, idom_id in self.idom.items():
             if idom_id is not None and idom_id != nid:
                 self.dom_tree_children[idom_id].append(nid)
 
     def _compute_dom_frontier(self):
+        """Compute dominance frontiers (Cytron et al. 1991, §4.2)."""
         self.dom_frontier = defaultdict(set)
         for node in self._nodes:
             nid = _nid(node)
@@ -261,11 +410,17 @@ class DominatorTree:
                 continue
             for p in preds:
                 runner = p
-                while runner is not None and runner != self.idom.get(nid):
-                    self.dom_frontier[runner].add(nid)
-                    if runner == self.idom.get(runner):
+                visited: Set[Any] = set()
+                idom_of_nid = self.idom.get(nid)
+                while runner is not None and runner != idom_of_nid:
+                    if runner in visited:
                         break
-                    runner = self.idom.get(runner)
+                    visited.add(runner)
+                    self.dom_frontier[runner].add(nid)
+                    nxt = self.idom.get(runner)
+                    if nxt == runner:    # root
+                        break
+                    runner = nxt
 
     def _compute_depth(self):
         entry_id = _nid(self.cfg.entry)
@@ -291,7 +446,7 @@ class PostDominatorTree:
     Node A post-dominates B iff every path from B to the exit
     passes through A.
 
-    Uses the same algorithm as DominatorTree but on a reversed graph.
+    Uses the same (now-fixed) DominatorTree algorithm on a reversed graph.
     """
 
     def __init__(self, cfg: Cfg):
@@ -303,6 +458,7 @@ class PostDominatorTree:
         self._computed = False
 
     def compute(self) -> "PostDominatorTree":
+        """Compute immediate post-dominators."""
         if self._computed:
             return self
         self._dom.compute()
@@ -312,8 +468,20 @@ class PostDominatorTree:
         return self
 
     def post_dominates(self, a_id: Any, b_id: Any) -> bool:
+        """Return True if *a* post-dominates *b*."""
         self.compute()
         return self._dom.dominates(a_id, b_id)
+
+    def strictly_post_dominates(self, a_id: Any, b_id: Any) -> bool:
+        return a_id != b_id and self.post_dominates(a_id, b_id)
+
+    def common_post_dominator(self, a_id: Any, b_id: Any) -> Optional[Any]:
+        self.compute()
+        return self._dom.common_dominator(a_id, b_id)
+
+    def all_post_dominators(self, node_id: Any) -> Set[Any]:
+        self.compute()
+        return self._dom.all_dominators(node_id)
 
 
 class _ReversedCfg:
@@ -323,18 +491,20 @@ class _ReversedCfg:
         self._cfg = cfg
         real_exit = cfg.exit
         real_entry = cfg.entry
-        # In the reversed graph entry↔exit are swapped.
-        self.entry = _ReversedNode(real_exit, reverse=True)
-        self.exit = _ReversedNode(real_entry, reverse=True)
-        # Build reversed node map
         originals = _all_nodes(cfg)
         self._map: Dict[Any, _ReversedNode] = {}
         for n in originals:
-            rn = _ReversedNode(n, reverse=True)
+            rn = _ReversedNode(n)
             self._map[_nid(n)] = rn
-        # Fix up entry/exit
-        self._map[_nid(real_exit)] = self.entry
-        self._map[_nid(real_entry)] = self.exit
+        # In the reversed graph entry↔exit are swapped.
+        exit_id = _nid(real_exit)
+        entry_id = _nid(real_entry)
+        if exit_id not in self._map:
+            self._map[exit_id] = _ReversedNode(real_exit)
+        if entry_id not in self._map:
+            self._map[entry_id] = _ReversedNode(real_entry)
+        self.entry = self._map[exit_id]
+        self.exit = self._map[entry_id]
         # Assign reversed successors/predecessors
         for n in originals:
             rn = self._map[_nid(n)]
@@ -350,7 +520,7 @@ class _ReversedCfg:
 class _ReversedNode:
     """Thin wrapper that swaps successors/predecessors."""
 
-    def __init__(self, original: CfgNode, reverse: bool = False):
+    def __init__(self, original: CfgNode):
         self._original = original
         self.id = _nid(original)
         self.tokens = _node_tokens(original)
@@ -407,17 +577,13 @@ class NaturalLoopDetector:
     """
     Detect all natural loops in a CFG.
 
-    Algorithm:
+    Algorithm (Aho et al. §9.6):
     1. Compute dominator tree.
     2. Identify back-edges (edges n→h where h dominates n).
     3. For each back-edge, compute the natural loop body via
-       reverse reachability from n to h (staying within dominated
-       nodes).
+       reverse reachability from n to h.
     4. Merge loops with the same header.
     5. Compute nesting and exit edges.
-
-    Reference: Aho, Lam, Sethi, Ullman — "Compilers: Principles,
-    Techniques, & Tools", §9.6 (Natural Loops).
     """
 
     def __init__(self, cfg: Cfg, domtree: Optional[DominatorTree] = None):
@@ -435,7 +601,7 @@ class NaturalLoopDetector:
         nodes = _all_nodes(self.cfg)
         node_map = {_nid(n): n for n in nodes}
 
-        # Step 1: find back-edges
+        # Step 1: find back-edges (uses the fixed dominates())
         back_edges: List[Tuple[Any, Any]] = []
         for node in nodes:
             nid = _nid(node)
@@ -444,8 +610,7 @@ class NaturalLoopDetector:
                 if self.domtree.dominates(sid, nid):
                     back_edges.append((nid, sid))
 
-        # Step 2: compute loop body for each back-edge
-        # Group by header
+        # Step 2: group by header, compute body
         header_to_tails: Dict[Any, List[Any]] = defaultdict(list)
         for tail, header in back_edges:
             header_to_tails[header].append(tail)
@@ -473,7 +638,7 @@ class NaturalLoopDetector:
             raw_loops[header] = body
             raw_back[header] = [(t, header) for t in tails]
 
-        # Step 3: compute exit edges
+        # Step 3: exit edges
         loop_objects: Dict[Any, NaturalLoop] = {}
         for header, body in raw_loops.items():
             exits: List[Tuple[Any, Any]] = []
@@ -486,7 +651,6 @@ class NaturalLoopDetector:
                     if sid not in body:
                         exits.append((nid, sid))
 
-            # Find preheader: unique predecessor of header not in body
             preheader = None
             h_node = node_map.get(header)
             if h_node is not None:
@@ -503,8 +667,7 @@ class NaturalLoopDetector:
                 preheader=preheader,
             )
 
-        # Step 4: compute nesting
-        # Loop A is nested in loop B if A.body ⊂ B.body
+        # Step 4: nesting — A nested in B if A.body ⊂ B.body
         headers_by_size = sorted(loop_objects.keys(),
                                  key=lambda h: len(loop_objects[h].body))
         for i, h1 in enumerate(headers_by_size):
@@ -517,12 +680,17 @@ class NaturalLoopDetector:
                         loop_b.children.append(h1)
                     break
 
-        # Compute depth
-        def _depth(h: Any) -> int:
+        # Compute depth (cycle-safe)
+        def _depth(h: Any, seen: Optional[Set[Any]] = None) -> int:
+            if seen is None:
+                seen = set()
+            if h in seen:
+                return 1
+            seen.add(h)
             p = loop_objects[h].parent
             if p is None:
                 return 1
-            return _depth(p) + 1
+            return _depth(p, seen) + 1
 
         for h in loop_objects:
             loop_objects[h].depth = _depth(h)
@@ -534,7 +702,6 @@ class NaturalLoopDetector:
     def loop_for_node(self, node_id: Any) -> Optional[NaturalLoop]:
         """Return the innermost loop containing *node_id*, or None."""
         self.detect()
-        # innermost = highest depth
         best: Optional[NaturalLoop] = None
         for loop in self._loops:
             if node_id in loop.body:
@@ -554,21 +721,7 @@ class NaturalLoopDetector:
 
 @dataclass
 class LoopInvariantExpr:
-    """
-    An expression inside a loop body that does *not* change across
-    iterations and can therefore be hoisted to the loop preheader.
-
-    Attributes
-    ----------
-    token       : the cppcheckdata Token object of the root of the expression
-    token_id    : token Id
-    loop_header : header node id of the containing loop
-    text        : textual representation of the expression
-    file        : source file
-    line        : source line number
-    column      : source column
-    reason      : human-readable explanation of why this is invariant
-    """
+    """An expression inside a loop body that is loop-invariant."""
     token: Any
     token_id: Any
     loop_header: Any
@@ -586,22 +739,9 @@ class LoopInvariantAnalysis:
     An expression E inside a loop L is *loop-invariant* if **all** operands
     of E satisfy one of:
       (a) the operand is a constant (literal / constexpr),
-      (b) the operand is defined outside L (all reaching definitions
-          come from outside L),
+      (b) the operand is defined outside L,
       (c) the operand has exactly one reaching definition, and that
           definition is itself loop-invariant.
-
-    The analysis uses ValueFlow values attached to tokens to improve
-    precision: a variable whose ValueFlow value is ``isKnown`` and does
-    not change inside the loop is invariant regardless of reaching-def
-    information.
-
-    Parameters
-    ----------
-    cfg            : the control-flow graph
-    loops          : list of NaturalLoop objects (from NaturalLoopDetector)
-    configuration  : cppcheckdata.Configuration — provides tokenlist, variables,
-                     and ValueFlow data
     """
 
     def __init__(self, cfg: Cfg, loops: List[NaturalLoop],
@@ -620,7 +760,7 @@ class LoopInvariantAnalysis:
                 self._tok_to_node[_get_tok_id(tok)] = nid
 
     def run(self) -> "LoopInvariantAnalysis":
-        """Run the analysis. Idempotent."""
+        """Run the analysis.  Idempotent."""
         if self._computed:
             return self
         for loop in self.loops:
@@ -641,7 +781,6 @@ class LoopInvariantAnalysis:
 
     def _analyse_loop(self, loop: NaturalLoop):
         """Find invariant expressions within a single loop."""
-        # Collect all tokens inside the loop body
         body_tokens: List[Token] = []
         node_map = {_nid(n): n for n in _all_nodes(self.cfg)}
         for nid in loop.body:
@@ -652,7 +791,6 @@ class LoopInvariantAnalysis:
 
         # Sets of variables *defined* (written to) inside the loop
         defs_in_loop: Set[int] = set()
-        # Map: varId → list of definition tokens inside loop
         var_defs: Dict[int, List[Token]] = defaultdict(list)
 
         for tok in body_tokens:
@@ -684,7 +822,6 @@ class LoopInvariantAnalysis:
             tid = _get_tok_id(tok)
             if tid not in invariant_tids:
                 continue
-            # Only report "interesting" invariants — skip trivial constants
             if self._is_trivial_constant(tok):
                 continue
             self._invariants.append(LoopInvariantExpr(
@@ -701,7 +838,6 @@ class LoopInvariantAnalysis:
 
     def _is_definition(self, tok: Token) -> bool:
         """Heuristic: token is an assignment target."""
-        # Assignment: the token is the LHS operand of '='
         parent = getattr(tok, "astParent", None)
         if parent is None:
             return False
@@ -711,32 +847,20 @@ class LoopInvariantAnalysis:
             op1 = getattr(parent, "astOperand1", None)
             if op1 is tok:
                 return True
-            # Also catch ++ and -- applied directly
         if getattr(tok, "str", "") in ("++", "--"):
             return True
         return False
 
     def _is_computation(self, tok: Token) -> bool:
         """Is this token the root of a non-trivial computation subtree?"""
-        # We look for binary/unary operators and function calls that
-        # produce values used elsewhere.
         s = getattr(tok, "str", "")
-        # Binary arithmetic / comparison operators
         if s in ("+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^",
                  "<", ">", "<=", ">=", "==", "!=", "&&", "||"):
             return True
-        # Unary operators
         if s in ("!", "~") and getattr(tok, "astOperand1", None) is not None:
             return True
-        # Member access that computes something
         if s == "." or s == "->":
             return True
-        # Function calls are NOT invariant unless we can prove purity
-        # (we're conservative: skip them)
-        # A variable read that is invariant is interesting only if
-        # it appears as an operand inside an operator expression,
-        # not standalone. We handle that at the operand level.
-        # Also: subscript operator
         if s == "[":
             return True
         return False
@@ -744,12 +868,7 @@ class LoopInvariantAnalysis:
     def _expr_is_invariant(self, tok: Token, loop: NaturalLoop,
                            defs_in_loop: Set[int],
                            already_invariant: Set[Any]) -> bool:
-        """
-        Check if the expression rooted at *tok* is loop-invariant.
-        """
-        s = getattr(tok, "str", "")
-
-        # Check all operands
+        """Check if the expression rooted at *tok* is loop-invariant."""
         operands: List[Token] = []
         op1 = getattr(tok, "astOperand1", None)
         op2 = getattr(tok, "astOperand2", None)
@@ -757,7 +876,6 @@ class LoopInvariantAnalysis:
             operands.append(op1)
         if op2 is not None:
             operands.append(op2)
-
         for operand in operands:
             if not self._operand_is_invariant(operand, loop, defs_in_loop,
                                               already_invariant):
@@ -791,20 +909,14 @@ class LoopInvariantAnalysis:
         if self._is_computation(tok):
             return self._expr_is_invariant(tok, loop, defs_in_loop,
                                            already_invariant)
-
         return False
 
     def _valueflow_proves_invariant(self, tok: Token,
                                     loop: NaturalLoop) -> bool:
-        """
-        Use ValueFlow to check if a token's value is known-constant
-        throughout loop iterations.
-        """
+        """Use ValueFlow to check if token value is known-constant across iterations."""
         values = getattr(tok, "values", None)
         if not values:
             return False
-        # If all values are "known" (not conditional / possible)
-        # and they all agree on the same intvalue, the token is invariant.
         known_vals = [v for v in values
                       if getattr(v, "valueKind", "") == "known"
                       or getattr(v, "isKnown", False)]
@@ -847,7 +959,6 @@ class LoopInvariantAnalysis:
             operands.append(op1)
         if op2:
             operands.append(op2)
-
         reasons = []
         for operand in operands:
             vid = getattr(operand, "varId", None)
@@ -877,30 +988,23 @@ class InductionVariable:
     """
     Represents a basic or derived induction variable.
 
-    For a basic IV:  var_id incremented by `step` each iteration.
+    For a basic IV:  var_id incremented by ``step`` each iteration.
     For a derived IV: value = coeff * basic_iv + offset.
     """
     var_id: int
     kind: InductionVariableKind
     loop_header: Any
-    step: Optional[int] = None          # basic: increment per iteration
-    basic_iv: Optional[int] = None      # derived: var_id of the basic IV
-    coeff: int = 1                      # derived: multiplicative coefficient
-    offset: int = 0                     # derived: additive offset
-    init_token: Optional[Any] = None    # token where IV is initialised
-    update_token: Optional[Any] = None  # token where IV is updated
+    step: Optional[int] = None
+    basic_iv: Optional[int] = None
+    coeff: int = 1
+    offset: int = 0
+    init_token: Optional[Any] = None
+    update_token: Optional[Any] = None
 
 
 class InductionVariableAnalysis:
     """
     Identify basic and derived induction variables within natural loops.
-
-    A *basic induction variable* (BIV) is a variable whose only
-    definitions inside the loop are of the form  i = i ± c  where c
-    is loop-invariant.
-
-    A *derived induction variable* (DIV) is computed as  j = a * i + b
-    where i is a BIV and a, b are loop-invariant.
 
     Reference: Aho, Lam, Sethi, Ullman — "Compilers", §9.7.
     """
@@ -937,10 +1041,11 @@ class InductionVariableAnalysis:
                 if iv.kind == InductionVariableKind.DERIVED
                 and (header is None or iv.loop_header == header)]
 
+    # ------------------------------------------------------------------ #
+
     def _find_ivs(self, loop: NaturalLoop):
         body_tokens = self._collect_body_tokens(loop)
 
-        # Map: varId → list of definitions inside loop body
         var_defs: Dict[int, List[Token]] = defaultdict(list)
         for tok in body_tokens:
             vid = getattr(tok, "varId", None)
@@ -956,7 +1061,6 @@ class InductionVariableAnalysis:
             elif pstr in ("++", "--"):
                 var_defs[vid].append(parent)
 
-        # Identify BIVs
         invariant_tids: Set[Any] = set()
         if self.inv_analysis:
             self.inv_analysis.run()
@@ -976,7 +1080,6 @@ class InductionVariableAnalysis:
                 ))
                 biv_ids.add(vid)
 
-        # Identify DIVs: j = a * i + b where i is BIV
         for vid, defs in var_defs.items():
             if vid in biv_ids:
                 continue
@@ -996,17 +1099,13 @@ class InductionVariableAnalysis:
     def _is_basic_iv(self, vid: int, defs: List[Token],
                      loop: NaturalLoop, invariant_tids: Set[Any],
                      body_tokens: List[Token]) -> bool:
-        """
-        Variable vid is a BIV if every definition inside the loop
-        has the form  vid = vid ± c  (or vid++/vid--) where c is invariant.
-        """
         if not defs:
             return False
         for d in defs:
             dstr = getattr(d, "str", "")
             if dstr in ("++", "--"):
                 continue
-            if dstr == "+=" or dstr == "-=":
+            if dstr in ("+=", "-="):
                 rhs = getattr(d, "astOperand2", None)
                 if rhs is None:
                     return False
@@ -1017,7 +1116,6 @@ class InductionVariableAnalysis:
                 rhs = getattr(d, "astOperand2", None)
                 if rhs is None:
                     return False
-                # rhs must be: vid + c or vid - c
                 rhs_str = getattr(rhs, "str", "")
                 if rhs_str not in ("+", "-"):
                     return False
@@ -1025,16 +1123,13 @@ class InductionVariableAnalysis:
                 r_op2 = getattr(rhs, "astOperand2", None)
                 if r_op1 is None or r_op2 is None:
                     return False
-                # One of the operands must be vid, the other invariant
                 vid1 = getattr(r_op1, "varId", None)
                 vid2 = getattr(r_op2, "varId", None)
                 if vid1 == vid:
-                    if not self._is_invariant_operand(r_op2, loop,
-                                                      invariant_tids):
+                    if not self._is_invariant_operand(r_op2, loop, invariant_tids):
                         return False
                 elif vid2 == vid:
-                    if not self._is_invariant_operand(r_op1, loop,
-                                                      invariant_tids):
+                    if not self._is_invariant_operand(r_op1, loop, invariant_tids):
                         return False
                 else:
                     return False
@@ -1043,7 +1138,6 @@ class InductionVariableAnalysis:
         return True
 
     def _extract_step(self, defs: List[Token]) -> Optional[int]:
-        """Try to extract the constant step from BIV definitions."""
         for d in defs:
             dstr = getattr(d, "str", "")
             if dstr == "++":
@@ -1053,7 +1147,6 @@ class InductionVariableAnalysis:
             op2 = getattr(d, "astOperand2", None)
             if op2 is None:
                 continue
-            # For += / -=
             if dstr == "+=":
                 v = self._const_value(op2)
                 if v is not None:
@@ -1078,15 +1171,10 @@ class InductionVariableAnalysis:
                        biv_ids: Set[int], loop: NaturalLoop,
                        invariant_tids: Set[Any],
                        body_tokens: List[Token]) -> Optional[Tuple[int, int, int]]:
-        """
-        Check if vid is a derived IV of the form j = a * i + b.
-        Returns (basic_iv_id, coeff, offset) or None.
-        """
         if len(defs) != 1:
             return None
         d = defs[0]
-        dstr = getattr(d, "str", "")
-        if dstr != "=":
+        if getattr(d, "str", "") != "=":
             return None
         rhs = getattr(d, "astOperand2", None)
         return self._match_affine(rhs, biv_ids, loop, invariant_tids)
@@ -1094,19 +1182,14 @@ class InductionVariableAnalysis:
     def _match_affine(self, tok: Optional[Token], biv_ids: Set[int],
                       loop: NaturalLoop,
                       invariant_tids: Set[Any]) -> Optional[Tuple[int, int, int]]:
-        """Try to match tok as  a*biv+b  or  biv*a+b  etc."""
         if tok is None:
             return None
         s = getattr(tok, "str", "")
         vid = getattr(tok, "varId", None)
-
-        # Direct BIV reference: j = i  →  coeff=1, offset=0
         if vid and vid in biv_ids:
             return (vid, 1, 0)
-
         op1 = getattr(tok, "astOperand1", None)
         op2 = getattr(tok, "astOperand2", None)
-
         if s == "*" and op1 and op2:
             v1 = getattr(op1, "varId", None)
             v2 = getattr(op2, "varId", None)
@@ -1116,20 +1199,17 @@ class InductionVariableAnalysis:
                 return (v1, c2, 0)
             if v2 in biv_ids and c1 is not None:
                 return (v2, c1, 0)
-
         if s in ("+", "-") and op1 and op2:
             sub1 = self._match_affine(op1, biv_ids, loop, invariant_tids)
             sub2 = self._match_affine(op2, biv_ids, loop, invariant_tids)
             c1 = self._const_value(op1)
             c2 = self._const_value(op2)
-
             if sub1 and c2 is not None:
                 biv, coeff, off = sub1
                 return (biv, coeff, off + c2 if s == "+" else off - c2)
             if sub2 and c1 is not None and s == "+":
                 biv, coeff, off = sub2
                 return (biv, coeff, off + c1)
-
         return None
 
     def _is_invariant_operand(self, tok: Token, loop: NaturalLoop,
@@ -1138,7 +1218,6 @@ class InductionVariableAnalysis:
             return True
         if _get_tok_id(tok) in invariant_tids:
             return True
-        # Variable not defined in loop
         vid = getattr(tok, "varId", None)
         if vid:
             node_map = {_nid(n): n for n in _all_nodes(self.cfg)}
@@ -1159,7 +1238,6 @@ class InductionVariableAnalysis:
         return False
 
     def _const_value(self, tok: Optional[Token]) -> Optional[int]:
-        """Extract a compile-time integer constant from tok or its ValueFlow."""
         if tok is None:
             return None
         if getattr(tok, "isNumber", False) or getattr(tok, "isInt", False):
@@ -1196,10 +1274,10 @@ class InductionVariableAnalysis:
 class LoopBound:
     """Estimated iteration bound for a loop."""
     loop_header: Any
-    lower: Optional[int] = None   # minimum iterations (None = unknown)
-    upper: Optional[int] = None   # maximum iterations (None = unknown)
-    exact: Optional[int] = None   # exact count if deterministic
-    confidence: str = "possible"  # "certain" | "probable" | "possible"
+    lower: Optional[int] = None
+    upper: Optional[int] = None
+    exact: Optional[int] = None
+    confidence: str = "possible"   # "certain" | "probable" | "possible"
     description: str = ""
 
 
@@ -1207,13 +1285,6 @@ class LoopBoundAnalysis:
     """
     Estimate loop iteration bounds using induction variables,
     loop conditions, and ValueFlow data.
-
-    Strategy:
-    1. For each loop with a BIV:
-       - Find the loop exit condition (comparison involving the BIV).
-       - Extract the bound from the comparison operand.
-       - Compute iterations = (bound - init) / step.
-    2. Fall back to ValueFlow on the condition token.
     """
 
     def __init__(self, cfg: Cfg, loops: List[NaturalLoop],
@@ -1246,6 +1317,8 @@ class LoopBoundAnalysis:
                 return b
         return None
 
+    # ------------------------------------------------------------------ #
+
     def _analyse_loop(self, loop: NaturalLoop):
         bivs = []
         if self.iv_analysis:
@@ -1256,11 +1329,8 @@ class LoopBoundAnalysis:
         if header_node is None:
             return
 
-        # The loop condition is typically the last comparison in
-        # the header block or the first exit edge's source block.
         cond_tok = self._find_condition_token(header_node, loop, node_map)
         if cond_tok is None:
-            # Try ValueFlow fallback
             self._valueflow_bound(loop, node_map)
             return
 
@@ -1270,19 +1340,15 @@ class LoopBoundAnalysis:
                 self._bounds.append(bound)
                 return
 
-        # Fallback
         self._valueflow_bound(loop, node_map)
 
     def _find_condition_token(self, header_node: CfgNode,
                               loop: NaturalLoop,
                               node_map: Dict) -> Optional[Token]:
-        """Find the comparison token that controls loop exit."""
-        # Check header tokens
         for tok in reversed(_node_tokens(header_node)):
             s = getattr(tok, "str", "")
             if s in ("<", ">", "<=", ">=", "!=", "=="):
                 return tok
-        # Check exit edge sources
         for src_id, _ in loop.exit_edges:
             src = node_map.get(src_id)
             if src is None:
@@ -1296,9 +1362,6 @@ class LoopBoundAnalysis:
     def _bound_from_condition(self, biv: InductionVariable,
                               cond: Token,
                               loop: NaturalLoop) -> Optional[LoopBound]:
-        """
-        Given BIV and condition like  i < N, compute iterations.
-        """
         op1 = getattr(cond, "astOperand1", None)
         op2 = getattr(cond, "astOperand2", None)
         if op1 is None or op2 is None:
@@ -1308,7 +1371,6 @@ class LoopBoundAnalysis:
         vid2 = getattr(op2, "varId", None)
         cmp = getattr(cond, "str", "")
 
-        # Determine which operand is the BIV and which is the bound
         bound_tok: Optional[Token] = None
         if vid1 == biv.var_id:
             bound_tok = op2
@@ -1326,8 +1388,6 @@ class LoopBoundAnalysis:
         if step is None or step == 0:
             return None
 
-        # Compute iterations based on comparison operator
-        # for i = init; i < bound; i += step → iters = (bound - init) / step
         diff = bound_val - (init_val if init_val is not None else 0)
         if step > 0 and cmp in ("<", "!="):
             iters = max(0, (diff + step - 1) // step)
@@ -1354,8 +1414,6 @@ class LoopBoundAnalysis:
 
     def _find_init_value(self, biv: InductionVariable,
                          loop: NaturalLoop) -> Optional[int]:
-        """Find the initial value of a BIV from the preheader or ValueFlow."""
-        # Check preheader tokens
         if loop.preheader is not None:
             node_map = {_nid(n): n for n in _all_nodes(self.cfg)}
             pre = node_map.get(loop.preheader)
@@ -1370,7 +1428,7 @@ class LoopBoundAnalysis:
                             v = self._token_int_value(op2)
                             if v is not None:
                                 return v
-        return 0  # Common default
+        return 0
 
     def _token_int_value(self, tok: Optional[Token]) -> Optional[int]:
         if tok is None:
@@ -1391,8 +1449,7 @@ class LoopBoundAnalysis:
                     return int(iv)
         return None
 
-    def _valueflow_bound(self, loop: NaturalLoop,
-                         node_map: Dict):
+    def _valueflow_bound(self, loop: NaturalLoop, node_map: Dict):
         """Fallback: use ValueFlow conditions on exit-edge tokens."""
         for src_id, _ in loop.exit_edges:
             src = node_map.get(src_id)
@@ -1425,10 +1482,7 @@ class LoopBoundAnalysis:
 
 @dataclass(frozen=True)
 class PathCondition:
-    """
-    A single branch condition along a path.
-    Represented as (token_id_of_condition, branch_taken: bool).
-    """
+    """A single branch condition along a path."""
     condition_token_id: Any
     branch_taken: bool
     text: str = ""
@@ -1436,12 +1490,7 @@ class PathCondition:
 
 @dataclass
 class PathState:
-    """
-    Abstract state along a specific execution path.
-
-    Combines path conditions (which branches were taken) with
-    a variable state map (variable valuations / abstract values).
-    """
+    """Abstract state along a specific execution path."""
     conditions: Tuple[PathCondition, ...] = ()
     var_state: Dict[int, Any] = field(default_factory=dict)
     feasible: bool = True
@@ -1471,27 +1520,13 @@ class PathSensitiveAnalysis:
     """
     Path-sensitive analysis engine.
 
-    Instead of merging abstract states at join points (like classical
-    dataflow analysis), this tracks **separate** states per path
-    through the CFG.  Each distinct path is characterised by the
-    sequence of branch decisions taken.
-
-    To prevent exponential blow-up, the analysis enforces:
+    Instead of merging abstract states at join points, this tracks
+    **separate** states per path.  Enforces:
       - **k-limiting**: at most *k* paths per CFG node (default 32).
-      - **loop unrolling budget**: each loop back-edge is followed
-        at most *max_unroll* times per path (default 2).
+      - **loop unrolling budget**: each back-edge followed at most
+        *max_unroll* times per path (default 2).
       - **path merging heuristic**: paths with identical variable
-        states are merged even if their conditions differ.
-
-    Parameters
-    ----------
-    cfg             : the control-flow graph
-    configuration   : cppcheckdata.Configuration (for ValueFlow)
-    k_limit         : maximum number of path states per node
-    max_unroll      : maximum loop back-edge traversals per path
-
-    After .run():
-        .states_at(node_id) → List[PathState]
+        states are merged even if conditions differ.
     """
 
     def __init__(self, cfg: Cfg,
@@ -1534,15 +1569,12 @@ class PathSensitiveAnalysis:
         self._states[entry_id] = [initial]
         node_map = {_nid(n): n for n in _all_nodes(self.cfg)}
 
-        # back-edge counter per (path_id, node_id)
         back_count: Dict[Tuple[int, Any], int] = defaultdict(int)
-
-        # BFS worklist
         worklist: Deque[Any] = deque([entry_id])
         visited_iterations: Dict[Any, int] = defaultdict(int)
-        max_iterations = len(node_map) * self.k_limit * 4  # safety bound
-        iteration = 0
+        max_iterations = len(node_map) * self.k_limit * 4
 
+        iteration = 0
         while worklist and iteration < max_iterations:
             iteration += 1
             nid = worklist.popleft()
@@ -1563,33 +1595,30 @@ class PathSensitiveAnalysis:
 
                 for ps in current_states:
                     if is_branch:
-                        # Determine branch condition
                         cond_tok = self._branch_condition(node)
-                        branch_taken = (si == 0)  # Convention: 0=true, 1=false
+                        branch_taken = (si == 0)
                         cond = PathCondition(
-                            condition_token_id=_get_tok_id(cond_tok) if cond_tok else nid,
+                            condition_token_id=(_get_tok_id(cond_tok)
+                                                if cond_tok else nid),
                             branch_taken=branch_taken,
                             text=getattr(cond_tok, "str", "") if cond_tok else "",
                         )
                         new_ps = ps.with_condition(cond)
-                        # Check feasibility
                         new_ps = self._check_feasibility(new_ps, cond_tok,
                                                          branch_taken)
                     else:
                         new_ps = ps
 
-                    # Check back-edge budget
+                    # Back-edge budget (uses fixed dominates)
                     if self.domtree.dominates(sid, nid):
                         key = (new_ps.path_id, sid)
                         if back_count[key] >= self.max_unroll:
                             continue
                         back_count[key] += 1
 
-                    # Update variable state from tokens in current node
                     new_ps = self._apply_node_effects(new_ps, node)
                     new_states.append(new_ps)
 
-                # Merge with existing states at successor, enforce k-limit
                 existing = self._states.get(sid, [])
                 merged = self._merge_states(existing, new_states)
                 if merged != existing:
@@ -1599,14 +1628,12 @@ class PathSensitiveAnalysis:
                         worklist.append(sid)
 
     def _branch_condition(self, node: CfgNode) -> Optional[Token]:
-        """Find the condition token for a branch node."""
         tokens = _node_tokens(node)
         for tok in reversed(tokens):
             s = getattr(tok, "str", "")
             if s in ("<", ">", "<=", ">=", "==", "!=", "&&", "||", "!"):
                 return tok
             if getattr(tok, "isName", False) and not getattr(tok, "isOp", False):
-                # Could be a boolean variable as condition
                 parent = getattr(tok, "astParent", None)
                 if parent and getattr(parent, "str", "") in ("if", "while", "?"):
                     return tok
@@ -1614,7 +1641,6 @@ class PathSensitiveAnalysis:
 
     def _check_feasibility(self, ps: PathState, cond_tok: Optional[Token],
                            branch_taken: bool) -> PathState:
-        """Use ValueFlow to check if this branch is feasible."""
         if cond_tok is None:
             return ps
         values = getattr(cond_tok, "values", None)
@@ -1628,7 +1654,6 @@ class PathSensitiveAnalysis:
             if iv is not None:
                 cond_true = (int(iv) != 0)
                 if cond_true != branch_taken:
-                    # This path is infeasible
                     return PathState(
                         conditions=ps.conditions,
                         var_state=ps.var_state,
@@ -1638,7 +1663,6 @@ class PathSensitiveAnalysis:
 
     def _apply_node_effects(self, ps: PathState,
                             node: CfgNode) -> PathState:
-        """Update path state based on assignments in the node."""
         for tok in _node_tokens(node):
             parent = getattr(tok, "astParent", None)
             if parent is None:
@@ -1652,22 +1676,17 @@ class PathSensitiveAnalysis:
                     ps = ps.with_var(vid, val)
         return ps
 
-    def _evaluate(self, tok: Optional[Token],
-                  ps: PathState) -> Any:
-        """Best-effort evaluation of a token in the context of a path state."""
+    def _evaluate(self, tok: Optional[Token], ps: PathState) -> Any:
         if tok is None:
             return None
-        # Constant
         if getattr(tok, "isNumber", False):
             try:
                 return int(getattr(tok, "str", "0"))
             except (ValueError, TypeError):
                 return None
-        # Variable with known value
         vid = getattr(tok, "varId", None)
         if vid and vid in ps.var_state:
             return ps.var_state[vid]
-        # ValueFlow
         values = getattr(tok, "values", None)
         if values:
             known = [v for v in values
@@ -1679,7 +1698,6 @@ class PathSensitiveAnalysis:
 
     def _merge_states(self, existing: List[PathState],
                       incoming: List[PathState]) -> List[PathState]:
-        """Merge incoming states with existing, deduplicating by var_state."""
         seen: Dict[int, PathState] = {}
         for ps in existing:
             key = hash(frozenset(ps.var_state.items()))
@@ -1697,14 +1715,10 @@ class PathSensitiveAnalysis:
 
 class PathFeasibilityChecker:
     """
-    Determine whether a specific path through the CFG is feasible
-    by checking that all branch conditions along the path are
-    mutually satisfiable.
+    Determine whether a specific path is feasible by checking that all
+    branch conditions along the path are mutually satisfiable.
 
-    This uses a lightweight constraint-based approach:
-    - Each branch condition contributes a constraint on variables.
-    - Constraints are checked pairwise and via simple interval reasoning
-      (no SMT solver, just ValueFlow + interval propagation).
+    Uses lightweight interval reasoning (no SMT).
     """
 
     def __init__(self, cfg: Cfg,
@@ -1713,19 +1727,16 @@ class PathFeasibilityChecker:
         self.configuration = configuration
 
     def is_feasible(self, path_state: PathState) -> bool:
-        """Check if the conditions in a PathState are satisfiable."""
         if not path_state.feasible:
             return False
         constraints = self._extract_constraints(path_state)
         return self._check_constraints(constraints)
 
     def infeasible_reason(self, path_state: PathState) -> Optional[str]:
-        """If infeasible, return a human-readable reason."""
         if path_state.feasible:
             constraints = self._extract_constraints(path_state)
             if self._check_constraints(constraints):
                 return None
-        # Find conflicting conditions
         for i, c1 in enumerate(path_state.conditions):
             for c2 in path_state.conditions[i + 1:]:
                 if (c1.condition_token_id == c2.condition_token_id
@@ -1738,13 +1749,8 @@ class PathFeasibilityChecker:
         return "Path marked infeasible"
 
     def _extract_constraints(self, ps: PathState) -> List[Tuple[int, str, int]]:
-        """
-        Extract (var_id, op, value) constraints from path conditions.
-        E.g. condition x < 5 with branch_taken=True → (var_x, "<", 5).
-        """
         constraints: List[Tuple[int, str, int]] = []
         node_map = {_nid(n): n for n in _all_nodes(self.cfg)}
-
         for cond in ps.conditions:
             tok = self._find_token_by_id(cond.condition_token_id, node_map)
             if tok is None:
@@ -1754,23 +1760,18 @@ class PathFeasibilityChecker:
             op2 = getattr(tok, "astOperand2", None)
             if op1 is None or op2 is None:
                 continue
-
             vid = getattr(op1, "varId", None)
             val = self._token_int_value(op2)
             if vid is None or val is None:
                 continue
-
             effective_op = op
             if not cond.branch_taken:
                 effective_op = self._negate_op(op)
-
             if effective_op:
                 constraints.append((vid, effective_op, val))
         return constraints
 
     def _check_constraints(self, constraints: List[Tuple[int, str, int]]) -> bool:
-        """Lightweight interval-based constraint checking."""
-        # Per-variable: track interval [lo, hi]
         intervals: Dict[int, Tuple[float, float]] = {}
         for vid, op, val in constraints:
             lo, hi = intervals.get(vid, (float('-inf'), float('inf')))
@@ -1785,12 +1786,7 @@ class PathFeasibilityChecker:
             elif op == "==":
                 lo = max(lo, val)
                 hi = min(hi, val)
-            elif op == "!=":
-                # Weak: can't represent != as interval, skip
-                pass
             intervals[vid] = (lo, hi)
-
-        # Check feasibility: lo ≤ hi for all variables
         for vid, (lo, hi) in intervals.items():
             if lo > hi:
                 return False
@@ -1801,8 +1797,7 @@ class PathFeasibilityChecker:
                "==": "!=", "!=": "=="}
         return neg.get(op)
 
-    def _find_token_by_id(self, tid: Any,
-                          node_map: Dict) -> Optional[Token]:
+    def _find_token_by_id(self, tid: Any, node_map: Dict) -> Optional[Token]:
         for nid, node in node_map.items():
             for tok in _node_tokens(node):
                 if _get_tok_id(tok) == tid:
@@ -1835,7 +1830,7 @@ class PathFeasibilityChecker:
 
 @dataclass
 class CorrelationGroup:
-    """A set of branch points that are controlled by the same condition."""
+    """A set of branch points controlled by the same condition."""
     condition_var_id: int
     branch_node_ids: List[Any]
     description: str = ""
@@ -1843,13 +1838,8 @@ class CorrelationGroup:
 
 class BranchCorrelationAnalysis:
     """
-    Detect correlated branches: multiple branch points in the CFG
-    that test the same variable (or the same condition expression).
-
-    Knowing that two branches are correlated allows path-sensitive
-    analysis to prune more infeasible paths (e.g., after checking
-    ``p != NULL`` on one branch, the other branch testing ``p``
-    cannot take the null path).
+    Detect correlated branches: multiple branch points that test the
+    same variable (or the same condition expression).
     """
 
     def __init__(self, cfg: Cfg):
@@ -1860,13 +1850,11 @@ class BranchCorrelationAnalysis:
     def run(self) -> "BranchCorrelationAnalysis":
         if self._computed:
             return self
-        cond_map: Dict[int, List[Any]] = defaultdict(list)  # varId → node ids
-
+        cond_map: Dict[int, List[Any]] = defaultdict(list)
         for node in _all_nodes(self.cfg):
             succs = _successors(node)
             if len(succs) != 2:
                 continue
-            # Find condition variable
             for tok in reversed(_node_tokens(node)):
                 s = getattr(tok, "str", "")
                 if s in ("<", ">", "<=", ">=", "==", "!="):
@@ -1879,7 +1867,6 @@ class BranchCorrelationAnalysis:
                 if vid and getattr(tok, "isName", False):
                     cond_map[vid].append(_nid(node))
                     break
-
         for vid, nodes in cond_map.items():
             if len(nodes) >= 2:
                 self._groups.append(CorrelationGroup(
@@ -1895,7 +1882,6 @@ class BranchCorrelationAnalysis:
         return list(self._groups)
 
     def correlated_with(self, node_id: Any) -> List[Any]:
-        """Return other branch nodes correlated with *node_id*."""
         self.run()
         result: List[Any] = []
         for g in self._groups:
@@ -1913,7 +1899,7 @@ class UnreachableRegion:
     """A region of code that is unreachable under all feasible paths."""
     node_ids: FrozenSet[Any]
     reason: str
-    tokens: List[Any] = field(default_factory=list)  # representative tokens
+    tokens: List[Any] = field(default_factory=list)
 
     @property
     def file(self) -> str:
@@ -1931,16 +1917,9 @@ class UnreachableRegion:
 class UnreachableCodeDetector:
     """
     Detect unreachable code using multiple strategies:
-
-    1. **Structural**: nodes not reachable from entry via forward DFS.
-    2. **Path-condition pruning**: nodes reachable only via infeasible
-       paths (using PathSensitiveAnalysis + PathFeasibilityChecker).
-    3. **Post-dominator**: nodes that unconditionally follow a return/
-       exit statement.
-    4. **ValueFlow dead branches**: branches whose condition is known
-       to always be true or false.
-
-    Returns a list of UnreachableRegion objects.
+    1. Structural: nodes not reachable from entry via forward DFS.
+    2. Path-condition pruning via PathSensitiveAnalysis.
+    3. ValueFlow dead branches.
     """
 
     def __init__(self, cfg: Cfg,
@@ -1975,7 +1954,6 @@ class UnreachableCodeDetector:
         return ids
 
     def _structural_unreachable(self):
-        """Find nodes not reachable from entry."""
         all_ids = {_nid(n) for n in _all_nodes(self.cfg)}
         reachable: Set[Any] = set()
         worklist: Deque[CfgNode] = deque([self.cfg.entry])
@@ -1988,7 +1966,6 @@ class UnreachableCodeDetector:
             for succ in _successors(node):
                 if _nid(succ) not in reachable:
                     worklist.append(succ)
-
         unreachable = all_ids - reachable
         if unreachable:
             node_map = {_nid(n): n for n in _all_nodes(self.cfg)}
@@ -2004,7 +1981,6 @@ class UnreachableCodeDetector:
             ))
 
     def _valueflow_dead_branches(self):
-        """Find branches where the condition is always true or false."""
         node_map = {_nid(n): n for n in _all_nodes(self.cfg)}
         for node in _all_nodes(self.cfg):
             succs = _successors(node)
@@ -2021,7 +1997,6 @@ class UnreachableCodeDetector:
                      or getattr(v, "isKnown", False)]
             if not known:
                 continue
-            # If ALL known values agree, one branch is dead
             int_vals = set()
             for v in known:
                 iv = getattr(v, "intvalue", None)
@@ -2030,7 +2005,7 @@ class UnreachableCodeDetector:
             if len(int_vals) != 1:
                 continue
             always_true = int_vals.pop()
-            dead_index = 1 if always_true else 0  # dead = not-taken branch
+            dead_index = 1 if always_true else 0
             dead_succ = succs[dead_index]
             dead_id = _nid(dead_succ)
             dead_toks = _node_tokens(node_map.get(dead_id, dead_succ))
@@ -2043,21 +2018,18 @@ class UnreachableCodeDetector:
             ))
 
     def _path_infeasible_unreachable(self):
-        """Find nodes reachable only via infeasible paths."""
         if not self.path_analysis or not self.feasibility:
             return
         self.path_analysis.run()
         all_ids = {_nid(n) for n in _all_nodes(self.cfg)}
         already_reported = self.unreachable_node_ids()
         node_map = {_nid(n): n for n in _all_nodes(self.cfg)}
-
         for nid in all_ids:
             if nid in already_reported:
                 continue
             states = self.path_analysis.states_at(nid)
             if not states:
                 continue
-            # If ALL paths to this node are infeasible, the node is unreachable
             all_infeasible = all(
                 not self.feasibility.is_feasible(ps) for ps in states
             )
@@ -2080,7 +2052,7 @@ class UnreachableCodeDetector:
 
 
 # ===================================================================
-# Helper: token id extraction
+# Helper: token id extraction  (kept at module level as before)
 # ===================================================================
 
 def _get_tok_id(tok: Any) -> Any:
@@ -2090,6 +2062,897 @@ def _get_tok_id(tok: Any) -> Any:
     if hasattr(tok, "Id"):
         return tok.Id
     return id(tok)
+
+
+# ###################################################################
+#  NEW ANALYSES (11–18) — informed by control-flow graph literature
+# ###################################################################
+
+
+# ===================================================================
+# 11. Control Dependence Graph (CDG)
+# ===================================================================
+
+class ControlDependenceGraph:
+    """
+    Control-dependence graph as defined by Ferrante, Ottenstein & Warren
+    (1987): "The Program Dependence Graph and Its Use in Optimization."
+
+    Node B is control-dependent on node A iff:
+      1. There exists a path from A to B such that B post-dominates
+         every node on the path (exclusive of A).
+      2. A is not post-dominated by B.
+
+    Equivalently, B ∈ CDF(A) where CDF is the *control dependence
+    frontier* — the dominance frontier of the **reverse** CFG's
+    dominator tree.
+
+    This implementation leverages PostDominatorTree and its pdom_frontier.
+
+    Usage::
+
+        cdg = ControlDependenceGraph(cfg).compute()
+        for dep in cdg.dependences_of(node_id):
+            ...
+    """
+
+    def __init__(self, cfg: Cfg,
+                 pdom: Optional[PostDominatorTree] = None):
+        self.cfg = cfg
+        self.pdom = pdom or PostDominatorTree(cfg)
+        # cd_map[A] = set of node ids that are control-dependent on A
+        self.cd_map: Dict[Any, Set[Any]] = defaultdict(set)
+        # rev_cd_map[B] = set of node ids that B is control-dependent on
+        self.rev_cd_map: Dict[Any, Set[Any]] = defaultdict(set)
+        self._computed = False
+
+    def compute(self) -> "ControlDependenceGraph":
+        if self._computed:
+            return self
+        self.pdom.compute()
+        # For every CFG edge (A → B) where B does NOT post-dominate A,
+        # walk up B's post-dominator chain until we reach ipdom(A).
+        # Every node on that walk (including B) is control-dependent on A.
+        node_map = {_nid(n): n for n in _all_nodes(self.cfg)}
+        for node in _all_nodes(self.cfg):
+            a_id = _nid(node)
+            ipdom_a = self.pdom.ipdom.get(a_id)
+            for succ in _successors(node):
+                b_id = _nid(succ)
+                runner = b_id
+                visited: Set[Any] = set()
+                while runner is not None and runner != ipdom_a:
+                    if runner in visited:
+                        break
+                    visited.add(runner)
+                    self.cd_map[a_id].add(runner)
+                    self.rev_cd_map[runner].add(a_id)
+                    nxt = self.pdom.ipdom.get(runner)
+                    if nxt == runner:  # root of post-dom tree
+                        break
+                    runner = nxt
+        self._computed = True
+        return self
+
+    def dependences_of(self, node_id: Any) -> Set[Any]:
+        """Return nodes that are control-dependent on *node_id*."""
+        self.compute()
+        return set(self.cd_map.get(node_id, set()))
+
+    def controllers_of(self, node_id: Any) -> Set[Any]:
+        """Return nodes that *node_id* is control-dependent on."""
+        self.compute()
+        return set(self.rev_cd_map.get(node_id, set()))
+
+    def all_dependences(self) -> Dict[Any, Set[Any]]:
+        self.compute()
+        return dict(self.cd_map)
+
+
+# ===================================================================
+# 12. Interval Analysis (Allen & Cocke)
+# ===================================================================
+
+@dataclass
+class Interval:
+    """An interval in the derived graph (Allen–Cocke T1/T2 reduction)."""
+    header: Any
+    nodes: FrozenSet[Any]
+    level: int = 0   # reduction level (0 = original graph)
+
+
+class IntervalAnalysis:
+    """
+    Compute T1/T2 interval structure of a CFG (Allen & Cocke, 1972).
+
+    An *interval* I(h) with header h is the maximal subgraph such that:
+      - h is in I(h).
+      - Any node n ≠ h in I(h) has all its predecessors in I(h).
+      - I(h) is a connected sub-graph.
+
+    The analysis iteratively partitions the graph into intervals,
+    then collapses each interval into a single node to form the
+    *derived graph*, and repeats until the graph is a single node
+    (reducible) or no more collapsing is possible (irreducible).
+    """
+
+    def __init__(self, cfg: Cfg):
+        self.cfg = cfg
+        self._intervals: List[List[Interval]] = []  # per level
+        self._reducible: Optional[bool] = None
+        self._computed = False
+
+    def compute(self) -> "IntervalAnalysis":
+        if self._computed:
+            return self
+        self._compute_intervals()
+        self._computed = True
+        return self
+
+    def intervals(self, level: int = 0) -> List[Interval]:
+        """Return intervals at a given reduction level."""
+        self.compute()
+        if level < len(self._intervals):
+            return list(self._intervals[level])
+        return []
+
+    def is_reducible(self) -> bool:
+        """Return True if the CFG is reducible (T1/T2 reducible)."""
+        self.compute()
+        return bool(self._reducible)
+
+    def all_levels(self) -> List[List[Interval]]:
+        self.compute()
+        return [list(lvl) for lvl in self._intervals]
+
+    def _compute_intervals(self):
+        # Build adjacency from CFG
+        all_ids = [_nid(n) for n in _all_nodes(self.cfg)]
+        succ_map: Dict[Any, List[Any]] = defaultdict(list)
+        pred_map: Dict[Any, List[Any]] = defaultdict(list)
+        for n in _all_nodes(self.cfg):
+            nid = _nid(n)
+            for s in _successors(n):
+                sid = _nid(s)
+                succ_map[nid].append(sid)
+                pred_map[sid].append(nid)
+
+        entry_id = _nid(self.cfg.entry)
+        level = 0
+
+        while True:
+            intervals = self._find_intervals(all_ids, succ_map, pred_map,
+                                             entry_id, level)
+            self._intervals.append(intervals)
+
+            if len(intervals) <= 1:
+                self._reducible = True
+                break
+
+            if len(intervals) == len(all_ids):
+                # No collapsing happened → irreducible
+                self._reducible = False
+                break
+
+            # Build derived graph
+            node_to_interval: Dict[Any, Any] = {}
+            for intv in intervals:
+                for nid in intv.nodes:
+                    node_to_interval[nid] = intv.header
+
+            new_ids = [intv.header for intv in intervals]
+            new_succ: Dict[Any, List[Any]] = defaultdict(list)
+            new_pred: Dict[Any, List[Any]] = defaultdict(list)
+
+            for intv in intervals:
+                h = intv.header
+                for nid in intv.nodes:
+                    for sid in succ_map.get(nid, []):
+                        target = node_to_interval.get(sid)
+                        if target is not None and target != h:
+                            if target not in new_succ[h]:
+                                new_succ[h].append(target)
+                                new_pred[target].append(h)
+
+            all_ids = new_ids
+            succ_map = new_succ
+            pred_map = new_pred
+            entry_id = node_to_interval.get(entry_id, entry_id)
+            level += 1
+
+    @staticmethod
+    def _find_intervals(all_ids: List[Any],
+                        succ_map: Dict[Any, List[Any]],
+                        pred_map: Dict[Any, List[Any]],
+                        entry_id: Any,
+                        level: int) -> List[Interval]:
+        assigned: Set[Any] = set()
+        intervals: List[Interval] = []
+        headers: Deque[Any] = deque([entry_id])
+
+        while headers:
+            h = headers.popleft()
+            if h in assigned:
+                continue
+            body: Set[Any] = {h}
+            assigned.add(h)
+            changed = True
+            while changed:
+                changed = False
+                for nid in list(all_ids):
+                    if nid in body or nid in assigned:
+                        continue
+                    preds_of_n = pred_map.get(nid, [])
+                    if preds_of_n and all(p in body for p in preds_of_n):
+                        body.add(nid)
+                        assigned.add(nid)
+                        changed = True
+            # New headers: successors of body nodes not yet assigned
+            for nid in body:
+                for sid in succ_map.get(nid, []):
+                    if sid not in assigned:
+                        headers.append(sid)
+            intervals.append(Interval(header=h, nodes=frozenset(body),
+                                      level=level))
+        return intervals
+
+
+# ===================================================================
+# 13. Structural Analysis (Sharir, 1980)
+# ===================================================================
+
+class RegionType(Enum):
+    BLOCK = auto()
+    IF_THEN = auto()
+    IF_THEN_ELSE = auto()
+    SELF_LOOP = auto()
+    WHILE_LOOP = auto()
+    NATURAL_LOOP = auto()
+    SEQUENCE = auto()
+    SWITCH = auto()
+    PROPER = auto()
+    IMPROPER = auto()
+
+
+@dataclass
+class StructuralRegion:
+    """A region identified by structural analysis."""
+    region_type: RegionType
+    node_ids: FrozenSet[Any]
+    entry_id: Any
+    children: List["StructuralRegion"] = field(default_factory=list)
+    parent: Optional["StructuralRegion"] = None
+
+
+class StructuralAnalysis:
+    """
+    Region-based structural analysis (Sharir, 1980).
+
+    Identifies high-level control structures (if-then-else, while,
+    sequences) by pattern matching on the CFG.
+    """
+
+    def __init__(self, cfg: Cfg,
+                 domtree: Optional[DominatorTree] = None):
+        self.cfg = cfg
+        self.domtree = domtree or DominatorTree(cfg)
+        self._regions: List[StructuralRegion] = []
+        self._computed = False
+
+    def compute(self) -> "StructuralAnalysis":
+        if self._computed:
+            return self
+        self.domtree.compute()
+        self._identify_regions()
+        self._computed = True
+        return self
+
+    def regions(self) -> List[StructuralRegion]:
+        self.compute()
+        return list(self._regions)
+
+    def region_for_node(self, node_id: Any) -> Optional[StructuralRegion]:
+        """Return the innermost region containing *node_id*."""
+        self.compute()
+        best: Optional[StructuralRegion] = None
+        for r in self._regions:
+            if node_id in r.node_ids:
+                if best is None or len(r.node_ids) < len(best.node_ids):
+                    best = r
+        return best
+
+    def _identify_regions(self):
+        node_map = {_nid(n): n for n in _all_nodes(self.cfg)}
+
+        for node in _all_nodes(self.cfg):
+            nid = _nid(node)
+            succs = [_nid(s) for s in _successors(node)]
+
+            # Self-loop
+            if nid in succs:
+                self._regions.append(StructuralRegion(
+                    region_type=RegionType.SELF_LOOP,
+                    node_ids=frozenset({nid}),
+                    entry_id=nid,
+                ))
+                continue
+
+            if len(succs) == 2:
+                t_id, f_id = succs[0], succs[1]
+                t_node = node_map.get(t_id)
+                f_node = node_map.get(f_id)
+
+                # If-then: one successor immediately reaches the other
+                if t_node is not None:
+                    t_succs = [_nid(s) for s in _successors(t_node)]
+                    if len(t_succs) == 1 and t_succs[0] == f_id:
+                        self._regions.append(StructuralRegion(
+                            region_type=RegionType.IF_THEN,
+                            node_ids=frozenset({nid, t_id, f_id}),
+                            entry_id=nid,
+                        ))
+                        continue
+
+                # If-then-else: both branches converge
+                if t_node is not None and f_node is not None:
+                    t_succs = set(_nid(s) for s in _successors(t_node))
+                    f_succs = set(_nid(s) for s in _successors(f_node))
+                    common = t_succs & f_succs
+                    if common:
+                        join = next(iter(common))
+                        self._regions.append(StructuralRegion(
+                            region_type=RegionType.IF_THEN_ELSE,
+                            node_ids=frozenset({nid, t_id, f_id, join}),
+                            entry_id=nid,
+                        ))
+                        continue
+
+            # Sequence: single-entry, single-exit chain
+            if len(succs) == 1:
+                chain = [nid]
+                cur = succs[0]
+                while cur is not None:
+                    c_node = node_map.get(cur)
+                    if c_node is None:
+                        break
+                    preds = [_nid(p) for p in _predecessors(c_node)]
+                    c_succs = [_nid(s) for s in _successors(c_node)]
+                    if len(preds) != 1 or preds[0] != chain[-1]:
+                        break
+                    chain.append(cur)
+                    if len(c_succs) != 1:
+                        break
+                    cur = c_succs[0]
+                if len(chain) >= 3:
+                    self._regions.append(StructuralRegion(
+                        region_type=RegionType.SEQUENCE,
+                        node_ids=frozenset(chain),
+                        entry_id=nid,
+                    ))
+
+
+# ===================================================================
+# 14. Cyclomatic Complexity Analyzer
+# ===================================================================
+
+@dataclass
+class CyclomaticResult:
+    """Cyclomatic complexity result."""
+    complexity: int
+    num_edges: int
+    num_nodes: int
+    num_connected: int = 1
+    description: str = ""
+
+
+class CyclomaticComplexityAnalyzer:
+    """
+    Compute McCabe's cyclomatic complexity: $V(G) = E - N + 2P$
+    where $E$ = edges, $N$ = nodes, $P$ = connected components.
+
+    Reference: McCabe, "A Complexity Measure", IEEE TSE, 1976.
+    """
+
+    def __init__(self, cfg: Cfg):
+        self.cfg = cfg
+        self._result: Optional[CyclomaticResult] = None
+
+    def compute(self) -> CyclomaticResult:
+        if self._result is not None:
+            return self._result
+
+        nodes = _all_nodes(self.cfg)
+        n = len(nodes)
+        e = 0
+        for node in nodes:
+            e += len(_successors(node))
+
+        # Connected components via BFS
+        all_ids = {_nid(nd) for nd in nodes}
+        node_map = {_nid(nd): nd for nd in nodes}
+        visited: Set[Any] = set()
+        p = 0
+        for nid in all_ids:
+            if nid in visited:
+                continue
+            p += 1
+            q: Deque[Any] = deque([nid])
+            while q:
+                cur = q.popleft()
+                if cur in visited:
+                    continue
+                visited.add(cur)
+                nd = node_map.get(cur)
+                if nd is None:
+                    continue
+                for s in _successors(nd):
+                    if _nid(s) not in visited:
+                        q.append(_nid(s))
+                for pr in _predecessors(nd):
+                    if _nid(pr) not in visited:
+                        q.append(_nid(pr))
+
+        v = e - n + 2 * p
+        self._result = CyclomaticResult(
+            complexity=v,
+            num_edges=e,
+            num_nodes=n,
+            num_connected=p,
+            description=f"V(G) = {e} - {n} + 2×{p} = {v}",
+        )
+        return self._result
+
+    @property
+    def complexity(self) -> int:
+        return self.compute().complexity
+
+
+# ===================================================================
+# 15. Strongly Connected Components (Tarjan)
+# ===================================================================
+
+@dataclass
+class SCC:
+    """A single strongly-connected component."""
+    nodes: FrozenSet[Any]
+    is_trivial: bool = False   # single node with no self-loop
+
+
+class StronglyConnectedComponents:
+    """
+    Tarjan's algorithm for finding all SCCs in a directed graph.
+
+    Reference: Tarjan, "Depth-First Search and Linear Graph
+    Algorithms", SIAM J. Comput. 1(2), 1972.
+    """
+
+    def __init__(self, cfg: Cfg):
+        self.cfg = cfg
+        self._sccs: List[SCC] = []
+        self._computed = False
+
+    def compute(self) -> "StronglyConnectedComponents":
+        if self._computed:
+            return self
+        self._tarjan()
+        self._computed = True
+        return self
+
+    def sccs(self) -> List[SCC]:
+        self.compute()
+        return list(self._sccs)
+
+    def non_trivial_sccs(self) -> List[SCC]:
+        """Return only SCCs with more than one node or a self-loop."""
+        return [s for s in self.sccs() if not s.is_trivial]
+
+    def scc_for_node(self, node_id: Any) -> Optional[SCC]:
+        self.compute()
+        for s in self._sccs:
+            if node_id in s.nodes:
+                return s
+        return None
+
+    def _tarjan(self):
+        all_nodes_list = _all_nodes(self.cfg)
+        node_map = {_nid(n): n for n in all_nodes_list}
+        index_counter = [0]
+        stack: List[Any] = []
+        on_stack: Set[Any] = set()
+        index: Dict[Any, int] = {}
+        lowlink: Dict[Any, int] = {}
+
+        def strongconnect(nid: Any):
+            index[nid] = index_counter[0]
+            lowlink[nid] = index_counter[0]
+            index_counter[0] += 1
+            stack.append(nid)
+            on_stack.add(nid)
+
+            nd = node_map.get(nid)
+            if nd is not None:
+                for s in _successors(nd):
+                    sid = _nid(s)
+                    if sid not in index:
+                        strongconnect(sid)
+                        lowlink[nid] = min(lowlink[nid], lowlink[sid])
+                    elif sid in on_stack:
+                        lowlink[nid] = min(lowlink[nid], index[sid])
+
+            if lowlink[nid] == index[nid]:
+                component: Set[Any] = set()
+                while True:
+                    w = stack.pop()
+                    on_stack.discard(w)
+                    component.add(w)
+                    if w == nid:
+                        break
+                fs = frozenset(component)
+                # Trivial if single node without self-loop
+                trivial = (len(component) == 1)
+                if trivial:
+                    the_id = next(iter(component))
+                    nd2 = node_map.get(the_id)
+                    if nd2 is not None:
+                        for s in _successors(nd2):
+                            if _nid(s) == the_id:
+                                trivial = False
+                                break
+                self._sccs.append(SCC(nodes=fs, is_trivial=trivial))
+
+        # Use iterative version to avoid stack overflow on large graphs
+        # (We keep the recursive version for clarity but guard with
+        # sys.setrecursionlimit if needed.)
+        sys_limit = sys.getrecursionlimit()
+        needed = len(all_nodes_list) + 100
+        if needed > sys_limit:
+            sys.setrecursionlimit(needed)
+        try:
+            for nid in [_nid(n) for n in all_nodes_list]:
+                if nid not in index:
+                    strongconnect(nid)
+        finally:
+            sys.setrecursionlimit(sys_limit)
+
+
+# ===================================================================
+# 16. Critical Edge Detector
+# ===================================================================
+
+@dataclass
+class CriticalEdge:
+    """An edge (src, dst) where src has multiple successors and
+    dst has multiple predecessors."""
+    src: Any
+    dst: Any
+
+
+class CriticalEdgeDetector:
+    """
+    Identify critical edges in the CFG.
+
+    A *critical edge* is an edge from a node with ≥2 successors to a
+    node with ≥2 predecessors.  Such edges are problematic for SSA
+    construction and many optimisations because inserting code "on
+    the edge" requires splitting it.
+    """
+
+    def __init__(self, cfg: Cfg):
+        self.cfg = cfg
+        self._edges: List[CriticalEdge] = []
+        self._computed = False
+
+    def compute(self) -> "CriticalEdgeDetector":
+        if self._computed:
+            return self
+        for node in _all_nodes(self.cfg):
+            succs = _successors(node)
+            if len(succs) < 2:
+                continue
+            nid = _nid(node)
+            for s in succs:
+                sid = _nid(s)
+                preds = _predecessors(s)
+                if len(preds) >= 2:
+                    self._edges.append(CriticalEdge(src=nid, dst=sid))
+        self._computed = True
+        return self
+
+    def critical_edges(self) -> List[CriticalEdge]:
+        self.compute()
+        return list(self._edges)
+
+    def has_critical_edges(self) -> bool:
+        self.compute()
+        return len(self._edges) > 0
+
+    def count(self) -> int:
+        self.compute()
+        return len(self._edges)
+
+
+# ===================================================================
+# 17. Loop Nesting Forest (Ramalingam, 2002)
+# ===================================================================
+
+@dataclass
+class LoopNestingNode:
+    """A node in the loop-nesting forest."""
+    node_id: Any
+    loop_header: Optional[Any] = None   # None = not a loop header
+    parent: Optional["LoopNestingNode"] = None
+    children: List["LoopNestingNode"] = field(default_factory=list)
+    depth: int = 0
+
+
+class LoopNestingForest:
+    """
+    Build Ramalingam's loop-nesting forest from the dominator tree
+    and back-edge information.
+
+    The forest has one tree per top-level loop; each tree node
+    corresponds to a loop header, with children being immediately
+    nested headers.  Non-loop nodes are leaves.
+
+    Reference: Ramalingam, "On Loops, Dominators, and Dominance
+    Frontiers", ACM TOPLAS 24(5), 2002.
+    """
+
+    def __init__(self, cfg: Cfg,
+                 domtree: Optional[DominatorTree] = None,
+                 loops: Optional[List[NaturalLoop]] = None):
+        self.cfg = cfg
+        self.domtree = domtree or DominatorTree(cfg)
+        self._loops = loops
+        self._forest: Dict[Any, LoopNestingNode] = {}
+        self._roots: List[LoopNestingNode] = []
+        self._computed = False
+
+    def compute(self) -> "LoopNestingForest":
+        if self._computed:
+            return self
+        self.domtree.compute()
+        if self._loops is None:
+            detector = NaturalLoopDetector(self.cfg, self.domtree)
+            self._loops = detector.detect()
+
+        # Create a nesting node for every CFG node
+        for node in _all_nodes(self.cfg):
+            nid = _nid(node)
+            self._forest[nid] = LoopNestingNode(node_id=nid)
+
+        # Mark loop headers
+        loop_headers: Set[Any] = set()
+        for loop in self._loops:
+            loop_headers.add(loop.header)
+            fn = self._forest.get(loop.header)
+            if fn:
+                fn.loop_header = loop.header
+
+        # Parent assignment: each node's parent in the nesting forest
+        # is the header of the innermost loop containing it (if any).
+        for loop in sorted(self._loops, key=lambda l: -l.depth):
+            for nid in loop.body:
+                if nid == loop.header:
+                    continue
+                fn = self._forest.get(nid)
+                if fn and fn.parent is None:
+                    parent_fn = self._forest.get(loop.header)
+                    if parent_fn:
+                        fn.parent = parent_fn
+                        parent_fn.children.append(fn)
+
+        # Loop header nesting: header's parent = enclosing loop's header
+        for loop in self._loops:
+            fn = self._forest.get(loop.header)
+            if fn and fn.parent is None and loop.parent is not None:
+                parent_fn = self._forest.get(loop.parent)
+                if parent_fn:
+                    fn.parent = parent_fn
+                    parent_fn.children.append(fn)
+
+        # Roots = nodes without parent
+        for fn in self._forest.values():
+            if fn.parent is None:
+                self._roots.append(fn)
+
+        # Compute depths
+        def _set_depth(node: LoopNestingNode, d: int):
+            node.depth = d
+            for ch in node.children:
+                _set_depth(ch, d + 1)
+
+        for root in self._roots:
+            _set_depth(root, 0)
+
+        self._computed = True
+        return self
+
+    def roots(self) -> List[LoopNestingNode]:
+        self.compute()
+        return list(self._roots)
+
+    def node(self, node_id: Any) -> Optional[LoopNestingNode]:
+        self.compute()
+        return self._forest.get(node_id)
+
+    def nesting_depth(self, node_id: Any) -> int:
+        fn = self.node(node_id)
+        return fn.depth if fn else 0
+
+
+# ===================================================================
+# 18. Def-Use Chain Builder
+# ===================================================================
+
+@dataclass
+class DefUseInfo:
+    """Def-use information for a single variable at a CFG node."""
+    var_id: int
+    defs: List[Any] = field(default_factory=list)   # token ids of definitions
+    uses: List[Any] = field(default_factory=list)    # token ids of uses
+
+
+class DefUseChainBuilder:
+    """
+    Build per-variable def-use and use-def chains over the CFG.
+
+    For each variable, identifies:
+      - Which CFG nodes define it.
+      - Which CFG nodes use it.
+      - The mapping from each definition to the set of uses it reaches.
+
+    This is a lightweight reaching-definitions analysis (Aho et al. §9.2)
+    that works directly on cppcheckdata tokens.
+    """
+
+    def __init__(self, cfg: Cfg):
+        self.cfg = cfg
+        # def_sites[var_id] = set of node ids that define the variable
+        self.def_sites: Dict[int, Set[Any]] = defaultdict(set)
+        # use_sites[var_id] = set of node ids that use the variable
+        self.use_sites: Dict[int, Set[Any]] = defaultdict(set)
+        # du_chains[var_id][(def_node_id, def_tok_id)] = set of (use_node_id, use_tok_id)
+        self.du_chains: Dict[int, Dict[Tuple[Any, Any], Set[Tuple[Any, Any]]]] = defaultdict(
+            lambda: defaultdict(set)
+        )
+        self._computed = False
+
+    def compute(self) -> "DefUseChainBuilder":
+        if self._computed:
+            return self
+        self._collect_defs_uses()
+        self._propagate_reaching_defs()
+        self._computed = True
+        return self
+
+    def defs_for(self, var_id: int) -> Set[Any]:
+        """Return node ids that define *var_id*."""
+        self.compute()
+        return set(self.def_sites.get(var_id, set()))
+
+    def uses_for(self, var_id: int) -> Set[Any]:
+        """Return node ids that use *var_id*."""
+        self.compute()
+        return set(self.use_sites.get(var_id, set()))
+
+    def uses_of_def(self, var_id: int, def_node_id: Any,
+                    def_tok_id: Any) -> Set[Tuple[Any, Any]]:
+        """Return (node_id, tok_id) pairs that use the definition."""
+        self.compute()
+        return set(self.du_chains.get(var_id, {}).get(
+            (def_node_id, def_tok_id), set()))
+
+    def _collect_defs_uses(self):
+        for node in _all_nodes(self.cfg):
+            nid = _nid(node)
+            for tok in _node_tokens(node):
+                vid = getattr(tok, "varId", None)
+                if not vid:
+                    continue
+                parent = getattr(tok, "astParent", None)
+                is_def = False
+                if parent:
+                    pstr = getattr(parent, "str", "")
+                    if pstr in ("=", "+=", "-=", "*=", "/=", "%=",
+                                "&=", "|=", "^=", "<<=", ">>="):
+                        if getattr(parent, "astOperand1", None) is tok:
+                            is_def = True
+                    elif pstr in ("++", "--"):
+                        is_def = True
+                if getattr(tok, "str", "") in ("++", "--"):
+                    is_def = True
+
+                if is_def:
+                    self.def_sites[vid].add(nid)
+                else:
+                    self.use_sites[vid].add(nid)
+
+    def _propagate_reaching_defs(self):
+        """Simple reaching-definitions propagation (gen/kill per block)."""
+        all_vars = set(self.def_sites.keys()) | set(self.use_sites.keys())
+        node_list = _all_nodes(self.cfg)
+        node_map = {_nid(n): n for n in node_list}
+        all_ids = [_nid(n) for n in node_list]
+
+        for vid in all_vars:
+            # gen[nid] = set of (nid, tok_id) for defs of vid in nid
+            gen: Dict[Any, Set[Tuple[Any, Any]]] = defaultdict(set)
+            for nid in self.def_sites.get(vid, set()):
+                nd = node_map.get(nid)
+                if nd is None:
+                    continue
+                for tok in _node_tokens(nd):
+                    if getattr(tok, "varId", None) == vid:
+                        parent = getattr(tok, "astParent", None)
+                        is_d = False
+                        if parent:
+                            pstr = getattr(parent, "str", "")
+                            if pstr in ("=", "+=", "-=", "*=", "/=",
+                                        "%=", "&=", "|=", "^=",
+                                        "<<=", ">>="):
+                                if getattr(parent, "astOperand1", None) is tok:
+                                    is_d = True
+                            elif pstr in ("++", "--"):
+                                is_d = True
+                        if getattr(tok, "str", "") in ("++", "--"):
+                            is_d = True
+                        if is_d:
+                            gen[nid].add((nid, _get_tok_id(tok)))
+
+            # Reaching defs: in[n] = ∪ out[p] for p in pred(n)
+            #                out[n] = gen[n] ∪ (in[n] - kill[n])
+            # For simplicity: kill[n] = gen[n] (strong update assumption)
+            rd_in: Dict[Any, Set[Tuple[Any, Any]]] = defaultdict(set)
+            rd_out: Dict[Any, Set[Tuple[Any, Any]]] = defaultdict(set)
+
+            changed = True
+            max_iter = len(all_ids) * 3 + 10
+            it = 0
+            while changed and it < max_iter:
+                changed = False
+                it += 1
+                for nid in all_ids:
+                    nd = node_map.get(nid)
+                    if nd is None:
+                        continue
+                    new_in: Set[Tuple[Any, Any]] = set()
+                    for p in _predecessors(nd):
+                        pid = _nid(p)
+                        new_in |= rd_out.get(pid, set())
+                    old_out = rd_out.get(nid, set())
+                    g = gen.get(nid, set())
+                    new_out = g | (new_in - g)  # gen ∪ (in - kill)
+                    if new_out != old_out:
+                        rd_out[nid] = new_out
+                        rd_in[nid] = new_in
+                        changed = True
+
+            # Build du-chains: for each use site, link reaching defs
+            for use_nid in self.use_sites.get(vid, set()):
+                nd = node_map.get(use_nid)
+                if nd is None:
+                    continue
+                reaching = rd_in.get(use_nid, set())
+                for tok in _node_tokens(nd):
+                    if getattr(tok, "varId", None) == vid:
+                        parent = getattr(tok, "astParent", None)
+                        is_d = False
+                        if parent:
+                            pstr = getattr(parent, "str", "")
+                            if pstr in ("=", "+=", "-=", "*=", "/=",
+                                        "%=", "&=", "|=", "^=",
+                                        "<<=", ">>="):
+                                if getattr(parent, "astOperand1", None) is tok:
+                                    is_d = True
+                            elif pstr in ("++", "--"):
+                                is_d = True
+                        if is_d:
+                            continue  # this is a def, not a use
+                        use_tid = _get_tok_id(tok)
+                        for def_key in reaching:
+                            self.du_chains[vid][def_key].add(
+                                (use_nid, use_tid))
 
 
 # ===================================================================
@@ -2105,7 +2968,7 @@ def run_all_ctrlflow_analysis(
     max_unroll: int = 2,
 ) -> Dict[str, Any]:
     """
-    Run all (or selected) control-flow analysis on a CFG.
+    Run all (or selected) control-flow analyses on a CFG.
 
     Parameters
     ----------
@@ -2115,7 +2978,9 @@ def run_all_ctrlflow_analysis(
                      Valid names: "dominators", "post_dominators", "loops",
                      "loop_invariants", "induction_vars", "loop_bounds",
                      "path_sensitive", "path_feasibility", "correlations",
-                     "unreachable"
+                     "unreachable", "cdg", "intervals", "structural",
+                     "cyclomatic", "scc", "critical_edges",
+                     "loop_nesting", "def_use"
     k_limit        : path-sensitive k-limit
     max_unroll     : path-sensitive loop unroll budget
 
@@ -2127,76 +2992,117 @@ def run_all_ctrlflow_analysis(
         "dominators", "post_dominators", "loops", "loop_invariants",
         "induction_vars", "loop_bounds", "path_sensitive",
         "path_feasibility", "correlations", "unreachable",
+        "cdg", "intervals", "structural", "cyclomatic", "scc",
+        "critical_edges", "loop_nesting", "def_use",
     }
     wanted = analysis if analysis is not None else ALL
     results: Dict[str, Any] = {}
 
-    # Dominators (many others depend on this)
-    domtree = None
+    # ---- core analyses (used by many others) ----
+    domtree: Optional[DominatorTree] = None
     if wanted & {"dominators", "loops", "loop_invariants", "induction_vars",
-                 "loop_bounds", "path_sensitive", "unreachable"}:
+                 "loop_bounds", "path_sensitive", "unreachable",
+                 "structural", "loop_nesting", "cdg"}:
         domtree = DominatorTree(cfg).compute()
         if "dominators" in wanted:
             results["dominators"] = domtree
 
-    # Post-dominators
-    if "post_dominators" in wanted:
-        pdt = PostDominatorTree(cfg).compute()
-        results["post_dominators"] = pdt
+    pdom: Optional[PostDominatorTree] = None
+    if wanted & {"post_dominators", "cdg"}:
+        pdom = PostDominatorTree(cfg).compute()
+        if "post_dominators" in wanted:
+            results["post_dominators"] = pdom
 
-    # Loops
-    loops: List[NaturalLoop] = []
-    if wanted & {"loops", "loop_invariants", "induction_vars", "loop_bounds"}:
+    loops: Optional[List[NaturalLoop]] = None
+    if wanted & {"loops", "loop_invariants", "induction_vars",
+                 "loop_bounds", "loop_nesting"}:
         detector = NaturalLoopDetector(cfg, domtree)
         loops = detector.detect()
         if "loops" in wanted:
             results["loops"] = loops
 
-    # Loop invariants
-    inv_analysis = None
-    if wanted & {"loop_invariants", "induction_vars"}:
-        inv_analysis = LoopInvariantAnalysis(cfg, loops, configuration).run()
-        if "loop_invariants" in wanted:
-            results["loop_invariants"] = inv_analysis
+    # ---- loop-based analyses ----
+    inv_analysis: Optional[LoopInvariantAnalysis] = None
+    if "loop_invariants" in wanted and loops is not None:
+        inv_analysis = LoopInvariantAnalysis(cfg, loops, configuration)
+        inv_analysis.run()
+        results["loop_invariants"] = inv_analysis
 
-    # Induction variables
-    iv_analysis = None
-    if wanted & {"induction_vars", "loop_bounds"}:
-        iv_analysis = InductionVariableAnalysis(
-            cfg, loops, inv_analysis, configuration,
-        ).run()
-        if "induction_vars" in wanted:
-            results["induction_vars"] = iv_analysis
+    iv_analysis: Optional[InductionVariableAnalysis] = None
+    if "induction_vars" in wanted and loops is not None:
+        iv_analysis = InductionVariableAnalysis(cfg, loops, inv_analysis,
+                                                configuration)
+        iv_analysis.run()
+        results["induction_vars"] = iv_analysis
 
-    # Loop bounds
-    if "loop_bounds" in wanted:
-        lb = LoopBoundAnalysis(cfg, loops, iv_analysis, configuration).run()
+    if "loop_bounds" in wanted and loops is not None:
+        lb = LoopBoundAnalysis(cfg, loops, iv_analysis, configuration)
+        lb.run()
         results["loop_bounds"] = lb
 
-    # Path-sensitive
-    psa = None
-    if wanted & {"path_sensitive", "unreachable"}:
-        psa = PathSensitiveAnalysis(
-            cfg, configuration, domtree, k_limit, max_unroll,
-        ).run()
-        if "path_sensitive" in wanted:
-            results["path_sensitive"] = psa
+    # ---- path-sensitive analyses ----
+    path_analysis: Optional[PathSensitiveAnalysis] = None
+    if "path_sensitive" in wanted:
+        path_analysis = PathSensitiveAnalysis(cfg, configuration, domtree,
+                                              k_limit, max_unroll)
+        path_analysis.run()
+        results["path_sensitive"] = path_analysis
 
-    # Path feasibility
-    pfc = None
-    if wanted & {"path_feasibility", "unreachable"}:
-        pfc = PathFeasibilityChecker(cfg, configuration)
-        if "path_feasibility" in wanted:
-            results["path_feasibility"] = pfc
+    feasibility: Optional[PathFeasibilityChecker] = None
+    if "path_feasibility" in wanted:
+        feasibility = PathFeasibilityChecker(cfg, configuration)
+        results["path_feasibility"] = feasibility
 
-    # Branch correlations
     if "correlations" in wanted:
-        bca = BranchCorrelationAnalysis(cfg).run()
+        bca = BranchCorrelationAnalysis(cfg)
+        bca.run()
         results["correlations"] = bca
 
-    # Unreachable code
     if "unreachable" in wanted:
-        ucd = UnreachableCodeDetector(cfg, configuration, psa, pfc).run()
+        ucd = UnreachableCodeDetector(cfg, configuration, path_analysis,
+                                      feasibility)
+        ucd.run()
         results["unreachable"] = ucd
 
+    # ---- new analyses (11–18) ----
+    if "cdg" in wanted:
+        cdg = ControlDependenceGraph(cfg, pdom)
+        cdg.compute()
+        results["cdg"] = cdg
+
+    if "intervals" in wanted:
+        ia = IntervalAnalysis(cfg)
+        ia.compute()
+        results["intervals"] = ia
+
+    if "structural" in wanted:
+        sa = StructuralAnalysis(cfg, domtree)
+        sa.compute()
+        results["structural"] = sa
+
+    if "cyclomatic" in wanted:
+        cc = CyclomaticComplexityAnalyzer(cfg)
+        results["cyclomatic"] = cc.compute()
+
+    if "scc" in wanted:
+        scc_obj = StronglyConnectedComponents(cfg)
+        scc_obj.compute()
+        results["scc"] = scc_obj
+
+    if "critical_edges" in wanted:
+        ce = CriticalEdgeDetector(cfg)
+        ce.compute()
+        results["critical_edges"] = ce
+
+    if "loop_nesting" in wanted:
+        lnf = LoopNestingForest(cfg, domtree, loops)
+        lnf.compute()
+        results["loop_nesting"] = lnf
+
+    if "def_use" in wanted:
+        du = DefUseChainBuilder(cfg)
+        du.compute()
+        results["def_use"] = du
+
     return results
+
