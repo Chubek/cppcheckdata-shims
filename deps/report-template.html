@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{{ title }}</title>
+<style>
+/* ================================================================
+   plus_reporter default template — Catppuccin Mocha palette
+   ================================================================ */
+*,*::before,*::after{box-sizing:border-box}
+
+body{
+  margin:0;
+  font-family:'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
+  background:#1e1e2e;color:#cdd6f4;line-height:1.6;
+}
+a{color:#89b4fa;text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* ---- Layout --------------------------------------------------- */
+.container{max-width:1200px;margin:0 auto;padding:1rem 2rem}
+
+header{
+  background:#181825;padding:1.2rem 2rem;
+  border-bottom:2px solid #313244;
+}
+header h1{margin:0;font-size:1.5rem;color:#cba6f7}
+header .meta{font-size:.85rem;color:#6c7086;margin-top:.3rem}
+
+/* ---- Summary badges ------------------------------------------- */
+.summary{display:flex;gap:1.5rem;flex-wrap:wrap;margin:1.5rem 0}
+.summary .badge{
+  padding:.5rem 1.2rem;border-radius:8px;
+  font-weight:600;font-size:1.1rem;
+}
+.badge.error{background:#45293a;color:#f38ba8}
+.badge.warning{background:#45392a;color:#fab387}
+.badge.style{background:#1e3a4a;color:#89dceb}
+.badge.performance{background:#302040;color:#cba6f7}
+.badge.portability{background:#1e2a4a;color:#89b4fa}
+.badge.information{background:#1e3a2e;color:#a6e3a1}
+.badge.debug{background:#232334;color:#6c7086}
+
+/* ---- Filter bar ----------------------------------------------- */
+.filters{margin-bottom:1rem;display:flex;gap:.6rem;flex-wrap:wrap}
+.filters label{
+  font-size:.85rem;padding:.3rem .8rem;border-radius:6px;
+  cursor:pointer;border:1px solid #313244;user-select:none;
+}
+.filters label:hover{background:#313244}
+.filters input[type=checkbox]{margin-right:.3rem}
+.search-box{
+  flex:1;min-width:200px;padding:.35rem .7rem;border-radius:6px;
+  border:1px solid #313244;background:#11111b;color:#cdd6f4;
+  font-size:.85rem;outline:none;
+}
+.search-box:focus{border-color:#89b4fa}
+
+/* ---- Diagnostic cards ----------------------------------------- */
+.diag{
+  background:#181825;border:1px solid #313244;border-radius:8px;
+  margin-bottom:1rem;overflow:hidden;
+}
+.diag-header{
+  padding:.7rem 1rem;display:flex;align-items:center;gap:.6rem;
+  cursor:pointer;user-select:none;
+}
+.diag-header:hover{background:#1e1e30}
+.diag-header .chevron{
+  transition:transform .2s;font-size:.7rem;color:#585b70;
+}
+.diag.open .diag-header .chevron{transform:rotate(90deg)}
+
+.diag-header .sev{
+  font-weight:700;text-transform:uppercase;font-size:.8rem;
+  min-width:8ch;
+}
+.sev.error{color:#f38ba8}
+.sev.warning{color:#fab387}
+.sev.style{color:#89dceb}
+.sev.performance{color:#cba6f7}
+.sev.portability{color:#89b4fa}
+.sev.information{color:#a6e3a1}
+.sev.debug{color:#6c7086}
+.sev.note{color:#89dceb}
+.sev.help{color:#a6e3a1}
+
+.diag-header .eid{color:#6c7086;font-family:monospace;font-size:.8rem}
+.diag-header .msg{flex:1;color:#cdd6f4}
+.diag-header .file-badge{
+  font-size:.75rem;color:#585b70;font-family:monospace;
+}
+
+.diag-body{padding:0 1rem 1rem 1rem;display:none}
+.diag.open .diag-body{display:block}
+
+/* ---- Code blocks ---------------------------------------------- */
+.code-block{
+  background:#11111b;border-radius:6px;padding:.8rem 1rem;
+  font-family:'Fira Code','Cascadia Code','JetBrains Mono',Consolas,monospace;
+  font-size:.85rem;overflow-x:auto;margin:.5rem 0;
+  line-height:1.7;
+}
+.code-block .ln{
+  color:#585b70;min-width:4ch;display:inline-block;
+  text-align:right;margin-right:1rem;user-select:none;
+}
+
+/* Highlighted spans in code */
+.code-block .span-error{color:#f38ba8;font-weight:700}
+.code-block .span-warning{color:#fab387;font-weight:700}
+.code-block .span-info{color:#89dceb}
+.code-block .span-help{color:#a6e3a1}
+.code-block .span-note{color:#89b4fa}
+
+/* Caret / underline rows */
+.underline-row{color:#585b70;white-space:pre}
+.underline-row .caret-error{color:#f38ba8;font-weight:700}
+.underline-row .caret-warning{color:#fab387;font-weight:700}
+.underline-row .caret-info{color:#89dceb}
+.underline-row .caret-help{color:#a6e3a1}
+.underline-row .caret-note{color:#89b4fa}
+.underline-row .label{margin-left:.5ch;font-style:italic}
+
+/* ---- Sub-parts (note, label) ---------------------------------- */
+.part{margin-top:.6rem}
+.part .part-head{font-size:.82rem;color:#a6adc8}
+.part .part-head .kind{font-weight:600}
+.part .location{
+  font-size:.8rem;color:#6c7086;font-family:monospace;
+  padding-left:2ch;
+}
+
+/* ---- Help messages -------------------------------------------- */
+.help-msg{
+  color:#a6e3a1;font-size:.85rem;padding:.3rem 0 .3rem 2rem;
+}
+.help-msg::before{content:'= help: ';font-weight:600}
+
+/* ---- Cppcheck-format line ------------------------------------- */
+.cppcheck-line{
+  font-family:monospace;font-size:.78rem;color:#585b70;
+  padding:.3rem 1rem;border-top:1px solid #313244;
+  word-break:break-all;
+}
+
+/* ---- Footer --------------------------------------------------- */
+footer{
+  text-align:center;padding:2rem;font-size:.75rem;color:#585b70;
+}
+
+/* ---- Responsive ----------------------------------------------- */
+@media(max-width:700px){
+  .container{padding:1rem}
+  .diag-header{flex-wrap:wrap}
+  .summary{flex-direction:column;gap:.6rem}
+}
+</style>
+</head>
+
+<body>
+<header>
+  <h1>{{ title }}</h1>
+  <div class="meta">
+    Generated {{ timestamp }} &mdash;
+    {{ total }} diagnostic{{ 's' if total != 1 else '' }}
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- Summary badges -->
+  <div class="summary">
+    {% for sev, count in severity_counts.items() %}
+    <div class="badge {{ sev }}">{{ sev }}: {{ count }}</div>
+    {% endfor %}
+  </div>
+
+  <!-- Filters -->
+  <div class="filters">
+    <input class="search-box" type="text" id="searchBox"
+           placeholder="Search messages, error IDs, files…"
+           oninput="filterDiags()"/>
+    {% for sev in severity_counts.keys() %}
+    <label>
+      <input type="checkbox" class="sev-filter" value="{{ sev }}"
+             checked onchange="filterDiags()"/>
+      {{ sev }}
+    </label>
+    {% endfor %}
+  </div>
+
+  <!-- Diagnostics -->
+  {% for diag in diagnostics %}
+  <div class="diag"
+       data-severity="{{ diag.severity }}"
+       data-text="{{ diag.message | lower }} {{ diag.error_id | lower }} {{ diag.cppcheck_line | lower }}"
+       id="diag-{{ loop.index }}">
+
+    <div class="diag-header"
+         onclick="this.parentElement.classList.toggle('open')">
+      <span class="chevron">&#9654;</span>
+      <span class="sev {{ diag.severity }}">{{ diag.severity }}</span>
+      <span class="eid">[{{ diag.error_id }}]</span>
+      <span class="msg">{{ diag.message }}</span>
+      {% if diag.parts and diag.parts[0].location %}
+      <span class="file-badge">
+        {{ diag.parts[0].location.file }}:{{ diag.parts[0].location.line }}
+      </span>
+      {% endif %}
+    </div>
+
+    <div class="diag-body">
+      {% for part in diag.parts %}
+      <div class="part">
+
+        {# Sub-diagnostic header (note / label) #}
+        {% if part.kind not in ('primary', 'help') and part.message %}
+        <div class="part-head">
+          <span class="kind">{{ part.kind }}</span>: {{ part.message }}
+        </div>
+        {% endif %}
+
+        {# Location arrow #}
+        {% if part.location %}
+        <div class="location">
+          &rarr; {{ part.location.file }}:{{ part.location.line -}}
+          {%- if part.location.column %}:{{ part.location.column }}{% endif %}
+        </div>
+        {% endif %}
+
+        {# Source code + underlines #}
+        {% if part.source_line %}
+        <div class="code-block">
+          <span class="ln">{{ part.location.line }}</span>{{ part.highlighted_html | safe }}
+          {% for sp in part.spans %}
+          <br/>
+          <span class="ln">&nbsp;</span>
+          <span class="underline-row">{{ sp.padding_html | safe -}}
+            <span class="caret-{{ sp.style }}">{{ sp.underline_chars }}</span>
+            {%- if sp.label %}
+            <span class="label caret-{{ sp.style }}">{{ sp.label }}</span>
+            {%- endif %}
+          </span>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        {# Help message #}
+        {% if part.kind == 'help' %}
+        <div class="help-msg">{{ part.message }}</div>
+        {% endif %}
+
+      </div>
+      {% endfor %}
+
+      <div class="cppcheck-line">{{ diag.cppcheck_line }}</div>
+    </div>
+  </div>
+  {% endfor %}
+
+</div>
+
+<footer>
+  plus_reporter &mdash; cppcheckdata_shims
+</footer>
+
+<script>
+// Toggle first diagnostic open by default
+document.addEventListener('DOMContentLoaded', () => {
+  const first = document.querySelector('.diag');
+  if (first) first.classList.add('open');
+});
+
+// Filter diagnostics by severity checkboxes and search text
+function filterDiags() {
+  const query = document.getElementById('searchBox').value.toLowerCase();
+  const checked = new Set(
+    [...document.querySelectorAll('.sev-filter:checked')]
+      .map(cb => cb.value)
+  );
+  document.querySelectorAll('.diag').forEach(el => {
+    const sev = el.dataset.severity;
+    const text = el.dataset.text || '';
+    const sevMatch = checked.has(sev);
+    const textMatch = !query || text.includes(query);
+    el.style.display = (sevMatch && textMatch) ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>
