@@ -168,9 +168,9 @@ class WorklistStrategy(enum.Enum):
     """Strategy for selecting the next worklist node."""
     FIFO = "fifo"
     LIFO = "lifo"
-    RPO  = "rpo"        # Reverse post-order (best for forward)
-    PO   = "po"         # Post-order (best for backward)
-    SCC  = "scc"        # SCC-based (best for loops / widening)
+    RPO = "rpo"        # Reverse post-order (best for forward)
+    PO = "po"         # Post-order (best for backward)
+    SCC = "scc"        # SCC-based (best for loops / widening)
 
 
 # ===========================================================================
@@ -699,14 +699,15 @@ class IntervalLattice(Lattice[IntervalValue]):
 class Sign(enum.Enum):
     """Abstract sign values."""
     BOTTOM = "⊥"
-    NEG    = "-"
-    ZERO   = "0"
-    POS    = "+"
-    TOP    = "⊤"
+    NEG = "-"
+    ZERO = "0"
+    POS = "+"
+    TOP = "⊤"
 
 
 # Pre-computed join table for the sign lattice
 _SIGN_JOIN: Dict[Tuple[Sign, Sign], Sign] = {}
+
 
 def _build_sign_join():
     for s in Sign:
@@ -720,6 +721,7 @@ def _build_sign_join():
                  (Sign.ZERO, Sign.POS)]:
         _SIGN_JOIN[(a, b)] = Sign.TOP
         _SIGN_JOIN[(b, a)] = Sign.TOP
+
 
 _build_sign_join()
 
@@ -933,7 +935,8 @@ class IntraproceduralSolver(Generic[L]):
         self.narrowing_iterations = narrowing_iterations
 
         # Pre-compute node orderings and loop heads
-        self._nodes: List = list(cfg.nodes.values()) if hasattr(cfg, 'nodes') else list(cfg)
+        self._nodes: List = list(cfg.nodes.values()) if hasattr(
+            cfg, 'nodes') else list(cfg)
         self._entry = getattr(cfg, 'entry', None)
         self._exit = getattr(cfg, 'exit', None)
         self._loop_heads: Set = set()
@@ -1059,7 +1062,8 @@ class IntraproceduralSolver(Generic[L]):
         in_edges = getattr(node, "in_edges", None)
         if in_edges:
             for edge in in_edges:
-                src = getattr(edge, "source", None) or getattr(edge, "src", None)
+                src = getattr(edge, "source", None) or getattr(
+                    edge, "src", None)
                 if src is not None:
                     preds.append(src)
         elif hasattr(node, "predecessors"):
@@ -1072,7 +1076,8 @@ class IntraproceduralSolver(Generic[L]):
         out_edges = getattr(node, "out_edges", None)
         if out_edges:
             for edge in out_edges:
-                dst = getattr(edge, "target", None) or getattr(edge, "dst", None)
+                dst = getattr(edge, "target", None) or getattr(
+                    edge, "dst", None)
                 if dst is not None:
                     succs.append(dst)
         elif hasattr(node, "successors"):
@@ -1083,7 +1088,8 @@ class IntraproceduralSolver(Generic[L]):
         """Get the CFG edge from src to dst, if available."""
         out_edges = getattr(src, "out_edges", [])
         for edge in out_edges:
-            target = getattr(edge, "target", None) or getattr(edge, "dst", None)
+            target = getattr(edge, "target", None) or getattr(
+                edge, "dst", None)
             if target is dst:
                 return edge
         return None
@@ -1096,7 +1102,8 @@ class IntraproceduralSolver(Generic[L]):
             fact = source_facts.get(pred, lat.bottom())
             # Apply edge transfer if available
             if self.edge_transfer is not None:
-                edge = self._get_edge(pred, node) if self.direction == Direction.FORWARD else self._get_edge(node, pred)
+                edge = self._get_edge(
+                    pred, node) if self.direction == Direction.FORWARD else self._get_edge(node, pred)
                 if edge is not None:
                     fact = self.edge_transfer(edge, fact)
             result = lat.join(result, fact)

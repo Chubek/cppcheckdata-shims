@@ -1172,7 +1172,8 @@ class IndentationConsistencyMetric(QualityMetric):
 
         if consistency < 0.7:
             pen = min(10.0, (1.0 - consistency) * 25.0)
-            dist_str = ", ".join(f"{k}sp:{v}" for k, v in counter.most_common(4))
+            dist_str = ", ".join(f"{k}sp:{v}" for k,
+                                 v in counter.most_common(4))
             issues.append(self.fb(
                 f"Inconsistent indentation widths: {dist_str} "
                 f"(dominant: {dominant_indent} spaces)",
@@ -1845,7 +1846,8 @@ class CommentDensityMetric(QualityMetric):
 
         # Rough heuristic: if there are no comment hints and the code
         # is substantial, flag it.
-        estimated_density = comment_hints / (total_lines / 10.0) if total_lines > 0 else 0
+        estimated_density = comment_hints / \
+            (total_lines / 10.0) if total_lines > 0 else 0
         estimated_density = min(1.0, estimated_density)
 
         if estimated_density < self.min_density:
@@ -1887,8 +1889,8 @@ class DoxygenCoverageMetric(QualityMetric):
         for d in directives:
             d_str = getattr(d, "str", "") or ""
             if any(kw in d_str for kw in ("/**", "/*!", "@brief", "\\brief",
-                                            "@param", "\\param", "@return",
-                                            "\\return")):
+                                          "@param", "\\param", "@return",
+                                          "\\return")):
                 f = getattr(d, "file", "")
                 ln = getattr(d, "linenr", 0) or 0
                 # Mark a range of lines as "documented"
@@ -2147,7 +2149,8 @@ class QualityScorer:
         ScoringResult
         """
         # Group metrics by dimension
-        dim_metrics: Dict[QualityDimension, List[QualityMetric]] = defaultdict(list)
+        dim_metrics: Dict[QualityDimension,
+                          List[QualityMetric]] = defaultdict(list)
         for m in self.metrics:
             dim_metrics[m.dimension].append(m)
 
@@ -2258,7 +2261,8 @@ class QualityScorer:
         """
         if not configs:
             empty_dims = {
-                dim: DimensionScore(dim, 100.0, 100.0 * self.weights.get(dim, 0), self.weights.get(dim, 0))
+                dim: DimensionScore(
+                    dim, 100.0, 100.0 * self.weights.get(dim, 0), self.weights.get(dim, 0))
                 for dim in QualityDimension
             }
             return ScoringResult(100.0, empty_dims, [], file_count=0)
@@ -2410,13 +2414,15 @@ def _cli_main() -> None:
     try:
         import cppcheckdata
     except ImportError:
-        print("ERROR: cppcheckdata module not found on sys.path", file=__import__("sys").stderr)
+        print("ERROR: cppcheckdata module not found on sys.path",
+              file=__import__("sys").stderr)
         raise SystemExit(1)
 
     data = cppcheckdata.parsedump(args.dumpfile)
     scorer = QualityScorer(weight_profile=weights)
 
-    configs = data.configurations if hasattr(data, "configurations") else [data]
+    configs = data.configurations if hasattr(
+        data, "configurations") else [data]
     if len(configs) == 1:
         result = scorer.score_tu(configs[0])
     else:

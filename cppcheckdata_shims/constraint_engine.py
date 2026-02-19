@@ -75,6 +75,7 @@ logger = logging.getLogger(__name__)
 # 1.1  Types
 # -------------------------------------------------------------------
 
+
 class CType(enum.Enum):
     """Simplified C type system for constraint typing."""
     BOOL = "bool"
@@ -189,28 +190,38 @@ class Constraint(ABC):
 
 class CTrue(Constraint):
     """Trivially-true constraint (⊤)."""
+
     def free_vars(self) -> FrozenSet[str]:
         return frozenset()
+
     def substitute(self, mapping):
         return self
+
     def negate(self):
         return CFalse()
+
     def to_smt(self, ctx):
         return ctx.mk_bool(True)
+
     def pretty(self):
         return "true"
 
 
 class CFalse(Constraint):
     """Trivially-false constraint (⊥)."""
+
     def free_vars(self) -> FrozenSet[str]:
         return frozenset()
+
     def substitute(self, mapping):
         return self
+
     def negate(self):
         return CTrue()
+
     def to_smt(self, ctx):
         return ctx.mk_bool(False)
+
     def pretty(self):
         return "false"
 
@@ -223,12 +234,16 @@ class CVar(Constraint):
 
     def free_vars(self):
         return frozenset({self.name})
+
     def substitute(self, mapping):
         return mapping.get(self.name, self)
+
     def negate(self):
         return CRelation(RelOp.EQ, self, CConst(0))
+
     def to_smt(self, ctx):
         return ctx.mk_var(self.name, self.ctype)
+
     def pretty(self):
         return self.name
 
@@ -241,14 +256,18 @@ class CConst(Constraint):
 
     def free_vars(self):
         return frozenset()
+
     def substitute(self, mapping):
         return self
+
     def negate(self):
         if isinstance(self.value, bool):
             return CConst(not self.value, CType.BOOL)
         return CRelation(RelOp.EQ, self, CConst(0))
+
     def to_smt(self, ctx):
         return ctx.mk_const(self.value, self.ctype)
+
     def pretty(self):
         return str(self.value)
 
@@ -287,15 +306,19 @@ class CRelation(Constraint):
 
     def free_vars(self):
         return self.lhs.free_vars() | self.rhs.free_vars()
+
     def substitute(self, mapping):
         return CRelation(self.op, self.lhs.substitute(mapping),
                          self.rhs.substitute(mapping))
+
     def negate(self):
         return CRelation(self.op.negate(), self.lhs, self.rhs)
+
     def to_smt(self, ctx):
         l = self.lhs.to_smt(ctx)
         r = self.rhs.to_smt(ctx)
         return ctx.mk_rel(self.op, l, r)
+
     def pretty(self):
         return f"({self.lhs.pretty()} {self.op.value} {self.rhs.pretty()})"
 
@@ -323,15 +346,19 @@ class CArith(Constraint):
 
     def free_vars(self):
         return self.lhs.free_vars() | self.rhs.free_vars()
+
     def substitute(self, mapping):
         return CArith(self.op, self.lhs.substitute(mapping),
-                       self.rhs.substitute(mapping), self.ctype)
+                      self.rhs.substitute(mapping), self.ctype)
+
     def negate(self):
         return CRelation(RelOp.EQ, self, CConst(0))
+
     def to_smt(self, ctx):
         l = self.lhs.to_smt(ctx)
         r = self.rhs.to_smt(ctx)
         return ctx.mk_arith(self.op, l, r, self.ctype)
+
     def pretty(self):
         return f"({self.lhs.pretty()} {self.op.value} {self.rhs.pretty()})"
 
@@ -345,15 +372,19 @@ class CUnaryOp(Constraint):
 
     def free_vars(self):
         return self.operand.free_vars()
+
     def substitute(self, mapping):
         return CUnaryOp(self.op, self.operand.substitute(mapping), self.ctype)
+
     def negate(self):
         if self.op == "!":
             return self.operand
         return CRelation(RelOp.EQ, self, CConst(0))
+
     def to_smt(self, ctx):
         inner = self.operand.to_smt(ctx)
         return ctx.mk_unary(self.op, inner, self.ctype)
+
     def pretty(self):
         return f"({self.op}{self.operand.pretty()})"
 
@@ -366,12 +397,16 @@ class CAnd(Constraint):
 
     def free_vars(self):
         return self.lhs.free_vars() | self.rhs.free_vars()
+
     def substitute(self, mapping):
         return CAnd(self.lhs.substitute(mapping), self.rhs.substitute(mapping))
+
     def negate(self):
         return COr(self.lhs.negate(), self.rhs.negate())
+
     def to_smt(self, ctx):
         return ctx.mk_and(self.lhs.to_smt(ctx), self.rhs.to_smt(ctx))
+
     def pretty(self):
         return f"({self.lhs.pretty()} ∧ {self.rhs.pretty()})"
 
@@ -384,12 +419,16 @@ class COr(Constraint):
 
     def free_vars(self):
         return self.lhs.free_vars() | self.rhs.free_vars()
+
     def substitute(self, mapping):
         return COr(self.lhs.substitute(mapping), self.rhs.substitute(mapping))
+
     def negate(self):
         return CAnd(self.lhs.negate(), self.rhs.negate())
+
     def to_smt(self, ctx):
         return ctx.mk_or(self.lhs.to_smt(ctx), self.rhs.to_smt(ctx))
+
     def pretty(self):
         return f"({self.lhs.pretty()} ∨ {self.rhs.pretty()})"
 
@@ -401,12 +440,16 @@ class CNot(Constraint):
 
     def free_vars(self):
         return self.inner.free_vars()
+
     def substitute(self, mapping):
         return CNot(self.inner.substitute(mapping))
+
     def negate(self):
         return self.inner
+
     def to_smt(self, ctx):
         return ctx.mk_not(self.inner.to_smt(ctx))
+
     def pretty(self):
         return f"(¬{self.inner.pretty()})"
 
@@ -419,14 +462,18 @@ class CImplies(Constraint):
 
     def free_vars(self):
         return self.antecedent.free_vars() | self.consequent.free_vars()
+
     def substitute(self, mapping):
         return CImplies(self.antecedent.substitute(mapping),
                         self.consequent.substitute(mapping))
+
     def negate(self):
         return CAnd(self.antecedent, self.consequent.negate())
+
     def to_smt(self, ctx):
         return ctx.mk_implies(self.antecedent.to_smt(ctx),
                               self.consequent.to_smt(ctx))
+
     def pretty(self):
         return f"({self.antecedent.pretty()} ⇒ {self.consequent.pretty()})"
 
@@ -440,13 +487,17 @@ class CForall(Constraint):
 
     def free_vars(self):
         return self.body.free_vars() - {self.var}
+
     def substitute(self, mapping):
         new_mapping = {k: v for k, v in mapping.items() if k != self.var}
         return CForall(self.var, self.ctype, self.body.substitute(new_mapping))
+
     def negate(self):
         return CExists(self.var, self.ctype, self.body.negate())
+
     def to_smt(self, ctx):
         return ctx.mk_forall(self.var, self.ctype, self.body.to_smt(ctx))
+
     def pretty(self):
         return f"(∀ {self.var}:{self.ctype.value}. {self.body.pretty()})"
 
@@ -460,13 +511,17 @@ class CExists(Constraint):
 
     def free_vars(self):
         return self.body.free_vars() - {self.var}
+
     def substitute(self, mapping):
         new_mapping = {k: v for k, v in mapping.items() if k != self.var}
         return CExists(self.var, self.ctype, self.body.substitute(new_mapping))
+
     def negate(self):
         return CForall(self.var, self.ctype, self.body.negate())
+
     def to_smt(self, ctx):
         return ctx.mk_exists(self.var, self.ctype, self.body.to_smt(ctx))
+
     def pretty(self):
         return f"(∃ {self.var}:{self.ctype.value}. {self.body.pretty()})"
 
@@ -480,22 +535,26 @@ class CInRange(Constraint):
 
     def free_vars(self):
         return frozenset({self.var})
+
     def substitute(self, mapping):
         if self.var in mapping:
             v = mapping[self.var]
             return CAnd(CRelation(RelOp.LE, CConst(self.lo), v),
                         CRelation(RelOp.LE, v, CConst(self.hi)))
         return self
+
     def negate(self):
         v = CVar(self.var)
         return COr(CRelation(RelOp.LT, v, CConst(self.lo)),
                    CRelation(RelOp.GT, v, CConst(self.hi)))
+
     def to_smt(self, ctx):
         v = ctx.mk_var(self.var, CType.INT)
         lo_smt = ctx.mk_const(self.lo, CType.INT)
         hi_smt = ctx.mk_const(self.hi, CType.INT)
         return ctx.mk_and(ctx.mk_rel(RelOp.LE, lo_smt, v),
                           ctx.mk_rel(RelOp.LE, v, hi_smt))
+
     def pretty(self):
         return f"({self.lo} ≤ {self.var} ≤ {self.hi})"
 
@@ -508,6 +567,7 @@ class CInSet(Constraint):
 
     def free_vars(self):
         return frozenset({self.var})
+
     def substitute(self, mapping):
         if self.var in mapping:
             v = mapping[self.var]
@@ -515,16 +575,19 @@ class CInSet(Constraint):
                          for val in sorted(self.values)]
             return _disjunction(disjuncts)
         return self
+
     def negate(self):
         v = CVar(self.var)
         conjuncts = [CRelation(RelOp.NE, v, CConst(val))
                      for val in sorted(self.values)]
         return _conjunction(conjuncts)
+
     def to_smt(self, ctx):
         v = ctx.mk_var(self.var, CType.INT)
         eqs = [ctx.mk_rel(RelOp.EQ, v, ctx.mk_const(val, CType.INT))
                for val in sorted(self.values)]
         return ctx.mk_or_many(eqs)
+
     def pretty(self):
         vals = ", ".join(str(v) for v in sorted(self.values))
         return f"({self.var} ∈ {{{vals}}})"
@@ -544,14 +607,18 @@ class CDomainPredicate(Constraint):
 
     def free_vars(self):
         return frozenset({self.var})
+
     def substitute(self, mapping):
         return self  # opaque — no structural substitution
+
     def negate(self):
         return CNot(self)
+
     def to_smt(self, ctx):
         # Attempt to concretize through the domain's concretization
         return ctx.mk_domain_pred(self.var, self.domain_name,
                                   self.abstract_value)
+
     def pretty(self):
         desc = self.description or f"{self.domain_name}({self.abstract_value})"
         return f"[{self.var}: {desc}]"
@@ -616,7 +683,8 @@ def constraint_size(c: Constraint) -> int:
     if isinstance(c, (CTrue, CFalse, CVar, CConst)):
         return 1
     if isinstance(c, (CAnd, COr, CImplies, CRelation)):
-        return 1 + constraint_size(c.lhs) + constraint_size(c.rhs)  # type: ignore
+        # type: ignore
+        return 1 + constraint_size(c.lhs) + constraint_size(c.rhs)
     if isinstance(c, CArith):
         return 1 + constraint_size(c.lhs) + constraint_size(c.rhs)
     if isinstance(c, (CNot, CUnaryOp)):
@@ -644,12 +712,18 @@ class SMTContext(ABC):
     def mk_bool(self, value: bool) -> Any: ...
     @abstractmethod
     def mk_var(self, name: str, ctype: CType) -> Any: ...
+
     @abstractmethod
-    def mk_const(self, value: Union[int, float, bool], ctype: CType) -> Any: ...
+    def mk_const(self, value: Union[int, float,
+                 bool], ctype: CType) -> Any: ...
+
     @abstractmethod
     def mk_rel(self, op: RelOp, lhs: Any, rhs: Any) -> Any: ...
+
     @abstractmethod
-    def mk_arith(self, op: ArithOp, lhs: Any, rhs: Any, ctype: CType) -> Any: ...
+    def mk_arith(self, op: ArithOp, lhs: Any,
+                 rhs: Any, ctype: CType) -> Any: ...
+
     @abstractmethod
     def mk_unary(self, op: str, inner: Any, ctype: CType) -> Any: ...
     @abstractmethod
@@ -684,7 +758,8 @@ class Z3SMTContext(SMTContext):
             import z3
             self._z3 = z3
         except ImportError:
-            raise ImportError("Z3 Python bindings ('z3-solver') required for Z3SMTContext")
+            raise ImportError(
+                "Z3 Python bindings ('z3-solver') required for Z3SMTContext")
         self._vars: Dict[str, Any] = {}
 
     def _get_sort(self, ctype: CType):
@@ -725,18 +800,28 @@ class Z3SMTContext(SMTContext):
 
     def mk_rel(self, op: RelOp, lhs, rhs):
         z3 = self._z3
-        if op == RelOp.EQ: return lhs == rhs
-        if op == RelOp.NE: return lhs != rhs
+        if op == RelOp.EQ:
+            return lhs == rhs
+        if op == RelOp.NE:
+            return lhs != rhs
         # For bit-vectors, use signed comparison by default
         if z3.is_bv(lhs):
-            if op == RelOp.LT: return lhs < rhs
-            if op == RelOp.LE: return lhs <= rhs
-            if op == RelOp.GT: return lhs > rhs
-            if op == RelOp.GE: return lhs >= rhs
-        if op == RelOp.LT: return lhs < rhs
-        if op == RelOp.LE: return lhs <= rhs
-        if op == RelOp.GT: return lhs > rhs
-        if op == RelOp.GE: return lhs >= rhs
+            if op == RelOp.LT:
+                return lhs < rhs
+            if op == RelOp.LE:
+                return lhs <= rhs
+            if op == RelOp.GT:
+                return lhs > rhs
+            if op == RelOp.GE:
+                return lhs >= rhs
+        if op == RelOp.LT:
+            return lhs < rhs
+        if op == RelOp.LE:
+            return lhs <= rhs
+        if op == RelOp.GT:
+            return lhs > rhs
+        if op == RelOp.GE:
+            return lhs >= rhs
         return lhs == rhs
 
     def mk_arith(self, op: ArithOp, lhs, rhs, ctype: CType):
@@ -907,7 +992,8 @@ class CheckResult(enum.Enum):
 class Witness:
     """A concrete witness (counterexample or reachability witness)."""
     variable_assignments: Dict[str, Union[int, float, str]]
-    path: List[str] = field(default_factory=list)        # sequence of locations
+    # sequence of locations
+    path: List[str] = field(default_factory=list)
     path_condition: Optional[Constraint] = None
     description: str = ""
 
@@ -997,7 +1083,8 @@ def assert_not_null(ptr_var: str,
     return Property(
         name=f"not_null_{ptr_var}",
         kind=PropertyKind.SAFETY,
-        constraint=CRelation(RelOp.NE, CVar(ptr_var, CType.POINTER), CConst(0)),
+        constraint=CRelation(RelOp.NE, CVar(
+            ptr_var, CType.POINTER), CConst(0)),
         function_name=function_name,
         tags={"null", "pointer"},
     )
@@ -1148,7 +1235,8 @@ class AbstractInterpretationConstraintGenerator(ConstraintGenerator):
                 return CInRange(var, lo, hi)
 
         # Sign domain: has .sign or is a string in {+, -, 0, ⊤, ⊥}
-        sign_val = getattr(abs_val, "sign", None) or (abs_val if isinstance(abs_val, str) else None)
+        sign_val = getattr(abs_val, "sign", None) or (
+            abs_val if isinstance(abs_val, str) else None)
         if sign_val in ("+", "positive"):
             return CRelation(RelOp.GT, CVar(var), CConst(0))
         if sign_val in ("-", "negative"):
@@ -1183,7 +1271,8 @@ class AbstractInterpretationConstraintGenerator(ConstraintGenerator):
 
         # Fallback: opaque domain predicate
         if abs_val is not None:
-            domain_name = type(abs_val).__name__ if self._domain is None else type(self._domain).__name__
+            domain_name = type(abs_val).__name__ if self._domain is None else type(
+                self._domain).__name__
             return CDomainPredicate(var, domain_name, abs_val)
 
         return CTrue()
@@ -1310,7 +1399,8 @@ class SymbolicExecutionConstraintGenerator(ConstraintGenerator):
         # SymUnaryOp
         if cls_name == "SymUnaryOp" or (hasattr(expr, "op") and hasattr(expr, "operand")):
             op_str = str(getattr(expr, "op", ""))
-            operand_c = self._symexpr_to_constraint(getattr(expr, "operand", None))
+            operand_c = self._symexpr_to_constraint(
+                getattr(expr, "operand", None))
             if operand_c is None:
                 return None
             if op_str == "!":
@@ -1319,9 +1409,12 @@ class SymbolicExecutionConstraintGenerator(ConstraintGenerator):
 
         # SymITE (if-then-else)
         if cls_name == "SymITE":
-            cond = self._symexpr_to_constraint(getattr(expr, "condition", None))
-            then_v = self._symexpr_to_constraint(getattr(expr, "then_val", None))
-            else_v = self._symexpr_to_constraint(getattr(expr, "else_val", None))
+            cond = self._symexpr_to_constraint(
+                getattr(expr, "condition", None))
+            then_v = self._symexpr_to_constraint(
+                getattr(expr, "then_val", None))
+            else_v = self._symexpr_to_constraint(
+                getattr(expr, "else_val", None))
             if cond and then_v and else_v:
                 return COr(CAnd(cond, then_v), CAnd(CNot(cond), else_v))
             return cond
@@ -1398,7 +1491,7 @@ class ValueFlowConstraintGenerator(ConstraintGenerator):
                 cond_str = getattr(cond, "str", "")
                 return CImplies(
                     CDomainPredicate("_cond", "cppcheck", cond,
-                                    description=f"condition: {cond_str}"),
+                                     description=f"condition: {cond_str}"),
                     CRelation(RelOp.EQ, CVar(var), CConst(intval))
                 )
             return CRelation(RelOp.EQ, CVar(var), CConst(intval))
@@ -1693,7 +1786,8 @@ class InternalConstraintSolver(ConstraintSolver):
                     old_lo, old_hi = bounds[c.var]
                     bounds[c.var] = (max(old_lo, float(lo)),
                                      min(old_hi, float(hi)))
-                equalities.setdefault(c.var, set()).update(int(v) for v in c.values)
+                equalities.setdefault(c.var, set()).update(int(v)
+                                                           for v in c.values)
 
 
 def get_constraint_solver(backend: str = "auto") -> ConstraintSolver:
@@ -1784,14 +1878,17 @@ class DomainReducer:
 
             # Check if the constraint set is feasible
             all_plus_range = constraints + [CInRange(var, lo, hi)]
-            feasibility = self._solver.check_sat(all_plus_range, timeout_ms=2000)
+            feasibility = self._solver.check_sat(
+                all_plus_range, timeout_ms=2000)
             if feasibility.result == SolverResult.UNSAT:
                 return CFalse()
 
             # Try to tighten lower bound
-            new_lo = self._binary_search_bound(var, constraints, lo, hi, "lower")
+            new_lo = self._binary_search_bound(
+                var, constraints, lo, hi, "lower")
             # Try to tighten upper bound
-            new_hi = self._binary_search_bound(var, constraints, lo, hi, "upper")
+            new_hi = self._binary_search_bound(
+                var, constraints, lo, hi, "upper")
 
             if new_lo is not None:
                 lo = new_lo
@@ -1818,7 +1915,8 @@ class DomainReducer:
 
             if direction == "lower":
                 # Can var be < mid?
-                test = constraints + [CRelation(RelOp.LT, CVar(var), CConst(mid))]
+                test = constraints + \
+                    [CRelation(RelOp.LT, CVar(var), CConst(mid))]
                 outcome = self._solver.check_sat(test, timeout_ms=1000)
                 if outcome.result == SolverResult.UNSAT:
                     # var cannot be < mid, so lower bound is at least mid
@@ -1830,7 +1928,8 @@ class DomainReducer:
                     break
             else:
                 # Can var be > mid?
-                test = constraints + [CRelation(RelOp.GT, CVar(var), CConst(mid))]
+                test = constraints + \
+                    [CRelation(RelOp.GT, CVar(var), CConst(mid))]
                 outcome = self._solver.check_sat(test, timeout_ms=1000)
                 if outcome.result == SolverResult.UNSAT:
                     hi = mid
@@ -1848,11 +1947,16 @@ class DomainReducer:
         """Update bounds based on a relational constraint."""
         if isinstance(c.lhs, CVar) and c.lhs.name == var and isinstance(c.rhs, CConst):
             v = float(c.rhs.value)
-            if c.op == RelOp.LE: hi = min(hi, v)
-            elif c.op == RelOp.LT: hi = min(hi, v - 1)
-            elif c.op == RelOp.GE: lo = max(lo, v)
-            elif c.op == RelOp.GT: lo = max(lo, v + 1)
-            elif c.op == RelOp.EQ: lo, hi = v, v
+            if c.op == RelOp.LE:
+                hi = min(hi, v)
+            elif c.op == RelOp.LT:
+                hi = min(hi, v - 1)
+            elif c.op == RelOp.GE:
+                lo = max(lo, v)
+            elif c.op == RelOp.GT:
+                lo = max(lo, v + 1)
+            elif c.op == RelOp.EQ:
+                lo, hi = v, v
         return lo, hi
 
 
@@ -2064,7 +2168,7 @@ class PropertyChecker:
                 ai_constraints, se_constraints, variables
             )
             refined_list = [c for c in refined.values()
-                           if not isinstance(c, CTrue)]
+                            if not isinstance(c, CTrue)]
 
             # Step 2: Check refined invariant ⇒ property
             if refined_list:
@@ -2119,7 +2223,8 @@ class PropertyChecker:
                     else:
                         # Spurious — add the negation of the counterexample
                         # as a constraint to refine
-                        exclusion = _conjunction(counterexample_constraints).negate()
+                        exclusion = _conjunction(
+                            counterexample_constraints).negate()
                         ai_constraints.append(exclusion)
                         logger.info("CEGAR: spurious counterexample, refining")
                         continue
@@ -2202,7 +2307,8 @@ class PropertyDiscoverer:
                                     name=key,
                                     kind=PropertyKind.ABSENCE_OF_UB,
                                     constraint=CFalse(),  # always violated
-                                    function_name=self._enclosing_function(token),
+                                    function_name=self._enclosing_function(
+                                        token),
                                     tags={"ub", "division", "literal_zero"},
                                 ))
                     except (ValueError, TypeError):
@@ -2259,7 +2365,8 @@ class PropertyDiscoverer:
                                 seen.add(key)
                                 props.append(assert_not_null(
                                     base_name,
-                                    function_name=self._enclosing_function(token),
+                                    function_name=self._enclosing_function(
+                                        token),
                                 ))
 
         return props
@@ -2296,7 +2403,8 @@ class PropertyDiscoverer:
                                     seen.add(key)
                                     props.append(assert_array_bounds(
                                         index_name, size,
-                                        function_name=self._enclosing_function(token),
+                                        function_name=self._enclosing_function(
+                                            token),
                                     ))
                                 break
 
@@ -2314,7 +2422,7 @@ class PropertyDiscoverer:
                 next_tok = getattr(token, "next", None)
                 if next_tok and getattr(next_tok, "str", "") == "(":
                     ast_arg = getattr(next_tok, "astOperand1", None) or \
-                              getattr(next_tok, "astOperand2", None)
+                        getattr(next_tok, "astOperand2", None)
                     if ast_arg:
                         # Try to convert the AST to a constraint
                         c = self._token_ast_to_constraint(ast_arg)
@@ -2420,7 +2528,8 @@ class AnalysisConfig:
 
     # Abstract interpretation
     use_abstract_interpretation: bool = True
-    abstract_domain: str = "interval"       # "interval", "sign", "congruence", etc.
+    # "interval", "sign", "congruence", etc.
+    abstract_domain: str = "interval"
     widening_threshold: int = 5
 
     # Symbolic execution
@@ -2776,10 +2885,14 @@ class ConstraintSimplifier:
             l = self._simplify(c.lhs)
             r = self._simplify(c.rhs)
             # Identity & annihilation
-            if isinstance(l, CTrue): return r
-            if isinstance(r, CTrue): return l
-            if isinstance(l, CFalse): return CFalse()
-            if isinstance(r, CFalse): return CFalse()
+            if isinstance(l, CTrue):
+                return r
+            if isinstance(r, CTrue):
+                return l
+            if isinstance(l, CFalse):
+                return CFalse()
+            if isinstance(r, CFalse):
+                return CFalse()
             # Idempotence (structural equality)
             if l is r or (isinstance(l, CVar) and isinstance(r, CVar)
                           and l.name == r.name):
@@ -2794,10 +2907,14 @@ class ConstraintSimplifier:
         if isinstance(c, COr):
             l = self._simplify(c.lhs)
             r = self._simplify(c.rhs)
-            if isinstance(l, CFalse): return r
-            if isinstance(r, CFalse): return l
-            if isinstance(l, CTrue): return CTrue()
-            if isinstance(r, CTrue): return CTrue()
+            if isinstance(l, CFalse):
+                return r
+            if isinstance(r, CFalse):
+                return l
+            if isinstance(l, CTrue):
+                return CTrue()
+            if isinstance(r, CTrue):
+                return CTrue()
             if l is r or (isinstance(l, CVar) and isinstance(r, CVar)
                           and l.name == r.name):
                 return l
@@ -2812,16 +2929,21 @@ class ConstraintSimplifier:
             # Double negation
             if isinstance(inner, CNot):
                 return inner.inner
-            if isinstance(inner, CTrue): return CFalse()
-            if isinstance(inner, CFalse): return CTrue()
+            if isinstance(inner, CTrue):
+                return CFalse()
+            if isinstance(inner, CFalse):
+                return CTrue()
             return CNot(inner)
 
         if isinstance(c, CImplies):
             a = self._simplify(c.antecedent)
             b = self._simplify(c.consequent)
-            if isinstance(a, CFalse): return CTrue()
-            if isinstance(a, CTrue): return b
-            if isinstance(b, CTrue): return CTrue()
+            if isinstance(a, CFalse):
+                return CTrue()
+            if isinstance(a, CTrue):
+                return b
+            if isinstance(b, CTrue):
+                return CTrue()
             return CImplies(a, b)
 
         if isinstance(c, CRelation):
@@ -2841,15 +2963,22 @@ class ConstraintSimplifier:
                     return CConst(result, c.ctype)
             # Algebraic identities
             if c.op == ArithOp.ADD:
-                if isinstance(r, CConst) and r.value == 0: return l
-                if isinstance(l, CConst) and l.value == 0: return r
+                if isinstance(r, CConst) and r.value == 0:
+                    return l
+                if isinstance(l, CConst) and l.value == 0:
+                    return r
             if c.op == ArithOp.SUB:
-                if isinstance(r, CConst) and r.value == 0: return l
+                if isinstance(r, CConst) and r.value == 0:
+                    return l
             if c.op == ArithOp.MUL:
-                if isinstance(r, CConst) and r.value == 1: return l
-                if isinstance(l, CConst) and l.value == 1: return r
-                if isinstance(r, CConst) and r.value == 0: return CConst(0, c.ctype)
-                if isinstance(l, CConst) and l.value == 0: return CConst(0, c.ctype)
+                if isinstance(r, CConst) and r.value == 1:
+                    return l
+                if isinstance(l, CConst) and l.value == 1:
+                    return r
+                if isinstance(r, CConst) and r.value == 0:
+                    return CConst(0, c.ctype)
+                if isinstance(l, CConst) and l.value == 0:
+                    return CConst(0, c.ctype)
             return CArith(c.op, l, r, c.ctype)
 
         if isinstance(c, CInRange):
@@ -2863,27 +2992,43 @@ class ConstraintSimplifier:
 
     @staticmethod
     def _eval_relop(op: RelOp, a, b) -> bool:
-        if op == RelOp.EQ: return a == b
-        if op == RelOp.NE: return a != b
-        if op == RelOp.LT: return a < b
-        if op == RelOp.LE: return a <= b
-        if op == RelOp.GT: return a > b
-        if op == RelOp.GE: return a >= b
+        if op == RelOp.EQ:
+            return a == b
+        if op == RelOp.NE:
+            return a != b
+        if op == RelOp.LT:
+            return a < b
+        if op == RelOp.LE:
+            return a <= b
+        if op == RelOp.GT:
+            return a > b
+        if op == RelOp.GE:
+            return a >= b
         return False
 
     @staticmethod
     def _eval_arith(op: ArithOp, a, b) -> Optional[Union[int, float]]:
         try:
-            if op == ArithOp.ADD: return a + b
-            if op == ArithOp.SUB: return a - b
-            if op == ArithOp.MUL: return a * b
-            if op == ArithOp.DIV: return a // b if b != 0 else None
-            if op == ArithOp.MOD: return a % b if b != 0 else None
-            if op == ArithOp.BAND: return int(a) & int(b)
-            if op == ArithOp.BOR: return int(a) | int(b)
-            if op == ArithOp.BXOR: return int(a) ^ int(b)
-            if op == ArithOp.SHL: return int(a) << int(b)
-            if op == ArithOp.SHR: return int(a) >> int(b)
+            if op == ArithOp.ADD:
+                return a + b
+            if op == ArithOp.SUB:
+                return a - b
+            if op == ArithOp.MUL:
+                return a * b
+            if op == ArithOp.DIV:
+                return a // b if b != 0 else None
+            if op == ArithOp.MOD:
+                return a % b if b != 0 else None
+            if op == ArithOp.BAND:
+                return int(a) & int(b)
+            if op == ArithOp.BOR:
+                return int(a) | int(b)
+            if op == ArithOp.BXOR:
+                return int(a) ^ int(b)
+            if op == ArithOp.SHL:
+                return int(a) << int(b)
+            if op == ArithOp.SHR:
+                return int(a) >> int(b)
         except (TypeError, ValueError, ZeroDivisionError):
             return None
         return None

@@ -158,7 +158,8 @@ class CType:
     var_id: int = -1                          # VAR
     tag: str = ""                              # STRUCT / UNION / ENUM
     field_map: Dict[str, CType] = field(default_factory=dict)  # STRUCT / UNION
-    field_order: List[str] = field(default_factory=list)        # preserves declaration order
+    # preserves declaration order
+    field_order: List[str] = field(default_factory=list)
     qualifiers: Set[Qualifier] = field(default_factory=set)      # QUALIFIED
     typedef_name: str = ""                     # TYPEDEF
     array_size: int = -1                       # ARRAY (-1 = unknown)
@@ -437,7 +438,8 @@ def _type_to_str(t: CType, depth: int = 0) -> str:
     if k == TypeKind.BOOL:
         return "_Bool"
     if k in {TypeKind.CHAR, TypeKind.SCHAR, TypeKind.UCHAR}:
-        prefix = {"signed": "signed ", "unsigned": "unsigned "}.get(t.sign or "", "")
+        prefix = {"signed": "signed ", "unsigned": "unsigned "}.get(
+            t.sign or "", "")
         return f"{prefix}char"
     if k in {TypeKind.SHORT, TypeKind.USHORT}:
         prefix = "unsigned " if t.sign == "unsigned" else ""
@@ -474,7 +476,8 @@ def _type_to_str(t: CType, depth: int = 0) -> str:
     if k == TypeKind.ENUM:
         return f"enum {t.tag}" if t.tag else "enum <anon>"
     if k == TypeKind.QUALIFIED:
-        qs = " ".join(q.name.lower() for q in sorted(t.qualifiers, key=lambda q: q.value))
+        qs = " ".join(q.name.lower()
+                      for q in sorted(t.qualifiers, key=lambda q: q.value))
         return f"{qs} {_type_to_str(t.children[0], depth + 1)}"
     if k == TypeKind.TYPEDEF:
         return f"typedef {t.typedef_name} = {_type_to_str(t.children[0], depth + 1)}"
@@ -739,7 +742,8 @@ class UnionFind:
                 zip(a.children, b.children)
             ):
                 label = "return type" if i == 0 else f"parameter {i}"
-                ok = self.unify(ca, cb, f"{context} ({label})", file, line, column) and ok
+                ok = self.unify(
+                    ca, cb, f"{context} ({label})", file, line, column) and ok
             return ok
 
         # ── Struct / Union: match by tag, then unify field types ─────
@@ -1216,7 +1220,8 @@ class ConstraintGenerator:
             if isinstance(arg_dict, dict):
                 for idx in sorted(arg_dict.keys()):
                     arg = arg_dict[idx]
-                    arg_vid = getattr(arg, "Id", None) or getattr(arg, "varId", None)
+                    arg_vid = getattr(arg, "Id", None) or getattr(
+                        arg, "varId", None)
                     arg_vt = getattr(arg, "valueType", None)
                     if arg_vt:
                         pt = valuetype_to_ctype(arg_vt, self.env)
@@ -1363,7 +1368,8 @@ class ConstraintGenerator:
             strlen_val = getattr(tok, "strlen", -1)
             # String literals are const char[]
             char_t = CType.qualified(CType.char_type(), {Qualifier.CONST})
-            arr_t = CType.array(char_t, (strlen_val + 1) if strlen_val >= 0 else -1)
+            arr_t = CType.array(char_t, (strlen_val + 1)
+                                if strlen_val >= 0 else -1)
             self._emit(expr_type, arr_t,
                        ConstraintKind.DECLARATION, f"string literal", tok)
             return expr_type
@@ -1445,15 +1451,22 @@ class ConstraintGenerator:
                 # + and - also work for pointer arithmetic
                 # If one is pointer and other is integer, result is pointer
                 # We emit a weaker constraint: both must be at least scalar
-                self._emit_scalar_constraint(lhs_type, f"'{s}' left operand", tok)
-                self._emit_scalar_constraint(rhs_type, f"'{s}' right operand", tok)
+                self._emit_scalar_constraint(
+                    lhs_type, f"'{s}' left operand", tok)
+                self._emit_scalar_constraint(
+                    rhs_type, f"'{s}' right operand", tok)
             elif s in {"*", "/"}:
-                self._emit_arithmetic_constraint(lhs_type, f"'{s}' left operand", tok)
-                self._emit_arithmetic_constraint(rhs_type, f"'{s}' right operand", tok)
-                self._emit_arithmetic_constraint(expr_type, f"'{s}' result", tok)
+                self._emit_arithmetic_constraint(
+                    lhs_type, f"'{s}' left operand", tok)
+                self._emit_arithmetic_constraint(
+                    rhs_type, f"'{s}' right operand", tok)
+                self._emit_arithmetic_constraint(
+                    expr_type, f"'{s}' result", tok)
             elif s == "%":
-                self._emit_integer_constraint(lhs_type, f"'%' left operand", tok)
-                self._emit_integer_constraint(rhs_type, f"'%' right operand", tok)
+                self._emit_integer_constraint(
+                    lhs_type, f"'%' left operand", tok)
+                self._emit_integer_constraint(
+                    rhs_type, f"'%' right operand", tok)
                 self._emit_integer_constraint(expr_type, f"'%' result", tok)
 
             return expr_type
@@ -1497,7 +1510,8 @@ class ConstraintGenerator:
             rhs_type = self._generate_for_expr(op2)
 
             self._emit_integer_constraint(lhs_type, f"'{s}' left operand", tok)
-            self._emit_integer_constraint(rhs_type, f"'{s}' right operand", tok)
+            self._emit_integer_constraint(
+                rhs_type, f"'{s}' right operand", tok)
             self._emit_integer_constraint(expr_type, f"'{s}' result", tok)
             return expr_type
 
@@ -1509,7 +1523,8 @@ class ConstraintGenerator:
             rhs_type = self._generate_for_expr(op2)
 
             self._emit_integer_constraint(lhs_type, f"'{s}' left operand", tok)
-            self._emit_integer_constraint(rhs_type, f"'{s}' right operand", tok)
+            self._emit_integer_constraint(
+                rhs_type, f"'{s}' right operand", tok)
             self._emit(expr_type, lhs_type,
                        ConstraintKind.SHIFT_OP,
                        f"shift result has type of left operand", tok)
@@ -1546,7 +1561,8 @@ class ConstraintGenerator:
             base_type = self._generate_for_expr(op1)
             index_type = self._generate_for_expr(op2)
 
-            self._emit_integer_constraint(index_type, "array subscript index", tok)
+            self._emit_integer_constraint(
+                index_type, "array subscript index", tok)
             # base must be ptr(α) or array(α, _); result is α
             expected_ptr = CType.ptr(expr_type)
             self._emit(base_type, expected_ptr,
@@ -1701,7 +1717,8 @@ class ConstraintGenerator:
         #  sizeof:  result is size_t (unsigned integer)
         # ═══════════════════════════════════════════════════════════════
         if s == "sizeof":
-            size_t = CType.long_type(signed=False)  # platform-dependent; use unsigned long
+            # platform-dependent; use unsigned long
+            size_t = CType.long_type(signed=False)
             self._emit(expr_type, size_t,
                        ConstraintKind.SIZEOF, "sizeof result is size_t", tok)
             if op1:
@@ -2022,27 +2039,43 @@ class WellFormednessRule(Enum):
     VOID_VARIABLE = auto()                    # §6.2.5: variable cannot have void type
     ARRAY_OF_VOID = auto()                    # §6.7.6.2: array element cannot be void
     ARRAY_OF_FUNCTION = auto()                # §6.7.6.2: array of functions forbidden
-    FUNCTION_RETURNING_ARRAY = auto()         # §6.7.6.3: function cannot return array
-    FUNCTION_RETURNING_FUNCTION = auto()      # §6.7.6.3: function cannot return function
-    RESTRICT_ON_NON_POINTER = auto()          # §6.7.3: restrict only on pointer types
-    ATOMIC_ARRAY = auto()                     # §6.7.3: _Atomic cannot qualify array type
-    ATOMIC_FUNCTION = auto()                  # §6.7.3: _Atomic cannot qualify function type
-    FLEXIBLE_ARRAY_NOT_LAST = auto()          # §6.7.2.1: flexible array must be last field
-    FLEXIBLE_ARRAY_ONLY_MEMBER = auto()       # §6.7.2.1: flexible array cannot be only member
-    DUPLICATE_STORAGE_CLASS = auto()           # §6.7.1: at most one storage class specifier
+    # §6.7.6.3: function cannot return array
+    FUNCTION_RETURNING_ARRAY = auto()
+    # §6.7.6.3: function cannot return function
+    FUNCTION_RETURNING_FUNCTION = auto()
+    # §6.7.3: restrict only on pointer types
+    RESTRICT_ON_NON_POINTER = auto()
+    # §6.7.3: _Atomic cannot qualify array type
+    ATOMIC_ARRAY = auto()
+    # §6.7.3: _Atomic cannot qualify function type
+    ATOMIC_FUNCTION = auto()
+    # §6.7.2.1: flexible array must be last field
+    FLEXIBLE_ARRAY_NOT_LAST = auto()
+    # §6.7.2.1: flexible array cannot be only member
+    FLEXIBLE_ARRAY_ONLY_MEMBER = auto()
+    # §6.7.1: at most one storage class specifier
+    DUPLICATE_STORAGE_CLASS = auto()
     INVALID_STORAGE_CLASS_COMBO = auto()       # §6.7.1: invalid combinations
-    BITFIELD_NON_INTEGER = auto()             # §6.7.2.1: bitfield must have integer type
-    BITFIELD_ZERO_NAMED = auto()              # §6.7.2.1: zero-width bitfield must be unnamed
+    # §6.7.2.1: bitfield must have integer type
+    BITFIELD_NON_INTEGER = auto()
+    # §6.7.2.1: zero-width bitfield must be unnamed
+    BITFIELD_ZERO_NAMED = auto()
     BITFIELD_EXCEEDS_TYPE = auto()            # §6.7.2.1: width exceeds type width
-    CONST_UNINITIALIZED = auto()              # §6.7.9: const object should be initialized
+    # §6.7.9: const object should be initialized
+    CONST_UNINITIALIZED = auto()
     VOID_PARAMETER_WITH_OTHERS = auto()       # §6.7.6.3: void alone in param list
     DUPLICATE_QUALIFIERS = auto()             # §6.7.3: duplicate qualifiers
-    SIGNED_UNSIGNED_FLOAT = auto()            # §6.7.2: signed/unsigned on float types
+    # §6.7.2: signed/unsigned on float types
+    SIGNED_UNSIGNED_FLOAT = auto()
     MULTIPLE_TYPE_SPECIFIERS = auto()         # §6.7.2: conflicting type specifiers
-    INCOMPLETE_RETURN_TYPE = auto()           # §6.9.1: function definition with incomplete return
-    REGISTER_ADDRESSOF = auto()              # §6.5.3.2: cannot take address of register variable
-    VOID_RETURN_WITH_VALUE = auto()           # §6.8.6.4: void function returning value
-    NONVOID_RETURN_WITHOUT_VALUE = auto()     # §6.8.6.4: non-void function missing return value
+    # §6.9.1: function definition with incomplete return
+    INCOMPLETE_RETURN_TYPE = auto()
+    # §6.5.3.2: cannot take address of register variable
+    REGISTER_ADDRESSOF = auto()
+    # §6.8.6.4: void function returning value
+    VOID_RETURN_WITH_VALUE = auto()
+    # §6.8.6.4: non-void function missing return value
+    NONVOID_RETURN_WITHOUT_VALUE = auto()
 
 
 @dataclass
@@ -2198,7 +2231,8 @@ class WellFormednessChecker:
                 fvid = getattr(fvar, "Id", None)
                 if fvid is None:
                     continue
-                ftype = self.uf.resolve(self.env.get_var_type(int(fvid))).unqualified
+                ftype = self.uf.resolve(
+                    self.env.get_var_type(int(fvid))).unqualified
                 if ftype.kind == TypeKind.ARRAY and ftype.array_size < 0:
                     if i != len(fields) - 1:
                         self._diag(
@@ -2704,7 +2738,8 @@ class TypeAnalysisResults:
                 warnings.append(f"[type] {d.message} ({d.file}:{d.line})")
         for w in self.wellformedness_diags:
             if w.severity == "warning":
-                warnings.append(f"[wellformed] {w.message} ({w.file}:{w.line})")
+                warnings.append(
+                    f"[wellformed] {w.message} ({w.file}:{w.line})")
         return warnings
 
     @property

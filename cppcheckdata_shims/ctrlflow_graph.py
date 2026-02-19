@@ -64,22 +64,23 @@ from typing import (
 # Edge kinds
 # ---------------------------------------------------------------------------
 
+
 class EdgeKind(enum.Enum):
     """Classification of a CFG edge."""
 
-    FALL_THROUGH    = "fall-through"
-    BRANCH_TRUE     = "branch-true"
-    BRANCH_FALSE    = "branch-false"
-    BACK_EDGE       = "back-edge"
-    BREAK           = "break"
-    CONTINUE        = "continue"
-    RETURN          = "return"
-    GOTO            = "goto"
-    SWITCH_CASE     = "switch-case"
-    SWITCH_DEFAULT  = "switch-default"
-    EXCEPTION       = "exception"
-    CALL            = "call"            # interprocedural (placeholder)
-    CALL_RETURN     = "call-return"     # interprocedural (placeholder)
+    FALL_THROUGH = "fall-through"
+    BRANCH_TRUE = "branch-true"
+    BRANCH_FALSE = "branch-false"
+    BACK_EDGE = "back-edge"
+    BREAK = "break"
+    CONTINUE = "continue"
+    RETURN = "return"
+    GOTO = "goto"
+    SWITCH_CASE = "switch-case"
+    SWITCH_DEFAULT = "switch-default"
+    EXCEPTION = "exception"
+    CALL = "call"            # interprocedural (placeholder)
+    CALL_RETURN = "call-return"     # interprocedural (placeholder)
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +670,8 @@ class _CFGBuilder:
                 and s not in ("case", "default")
             ):
                 # This is a label like "label_name:"
-                label_block = self._new_block(kind="label", scope=tok.scope if hasattr(tok, 'scope') else None)
+                label_block = self._new_block(
+                    kind="label", scope=tok.scope if hasattr(tok, 'scope') else None)
                 if current_block is not None:
                     self._edge(current_block, label_block)
                 self._labels[s] = label_block
@@ -680,7 +682,8 @@ class _CFGBuilder:
             # ---- return ----------------------------------------------------
             if s == "return":
                 # Collect tokens until ';'
-                ret_toks, semi = self._collect_tokens_until(tok, {";"}, limit_tok)
+                ret_toks, semi = self._collect_tokens_until(
+                    tok, {";"}, limit_tok)
                 if current_block is not None:
                     current_block.tokens.extend(ret_toks)
                     if semi:
@@ -699,7 +702,8 @@ class _CFGBuilder:
                         self._edge(current_block, break_target, EdgeKind.BREAK)
                     else:
                         # No break target? Shouldn't happen, but be safe
-                        self._edge(current_block, self.cfg.exit, EdgeKind.BREAK)
+                        self._edge(current_block, self.cfg.exit,
+                                   EdgeKind.BREAK)
                 tok = self._skip_past_semicolon(tok.next, limit_tok)
                 current_block = None
                 continue
@@ -709,9 +713,11 @@ class _CFGBuilder:
                 if current_block is not None:
                     current_block.tokens.append(tok)
                     if continue_target:
-                        self._edge(current_block, continue_target, EdgeKind.CONTINUE)
+                        self._edge(current_block, continue_target,
+                                   EdgeKind.CONTINUE)
                     else:
-                        self._edge(current_block, self.cfg.exit, EdgeKind.CONTINUE)
+                        self._edge(current_block, self.cfg.exit,
+                                   EdgeKind.CONTINUE)
                 tok = self._skip_past_semicolon(tok.next, limit_tok)
                 current_block = None
                 continue
@@ -725,7 +731,8 @@ class _CFGBuilder:
                         current_block.tokens.append(label_tok)
                     lbl_name = _tok_str(label_tok)
                     self._pending_gotos.append((current_block, lbl_name))
-                tok = self._skip_past_semicolon(tok.next, limit_tok) if tok.next else None
+                tok = self._skip_past_semicolon(
+                    tok.next, limit_tok) if tok.next else None
                 current_block = None
                 continue
 
@@ -1174,7 +1181,8 @@ class _CFGBuilder:
                     case_label_parts.append(tok.str)
                     tok = tok.next
                 case_label = " ".join(case_label_parts)
-                self._edge(dispatch_block, new_case, EdgeKind.SWITCH_CASE, label=case_label)
+                self._edge(dispatch_block, new_case,
+                           EdgeKind.SWITCH_CASE, label=case_label)
 
                 # Fall-through from previous case
                 if prev_case_exit is not None:
@@ -1212,7 +1220,8 @@ class _CFGBuilder:
                 continue
 
             if s == "return":
-                ret_toks, semi = self._collect_tokens_until(tok, {";"}, switch_body_end)
+                ret_toks, semi = self._collect_tokens_until(
+                    tok, {";"}, switch_body_end)
                 case_block.tokens.extend(ret_toks)
                 if semi:
                     case_block.tokens.append(semi)
@@ -1331,7 +1340,8 @@ def cfg_summary(cfg: CFG) -> str:
     """Return a multi-line human-readable summary of *cfg*."""
     lines = [repr(cfg)]
     for node in cfg.nodes:
-        succ_ids = ", ".join(f"BB{e.dst.id}({e.kind.value})" for e in node.successors)
+        succ_ids = ", ".join(
+            f"BB{e.dst.id}({e.kind.value})" for e in node.successors)
         pred_ids = ", ".join(f"BB{e.src.id}" for e in node.predecessors)
         lines.append(
             f"  BB{node.id} [{node.kind}] "

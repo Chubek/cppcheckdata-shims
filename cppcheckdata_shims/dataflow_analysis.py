@@ -1850,7 +1850,8 @@ class PointerAnalysis(DataflowAnalysis[PtsState]):
             if func:
                 for arg in getattr(func, "argument", {}).values():
                     var = getattr(arg, "variable", arg)
-                    vid = getattr(var, "Id", None) or getattr(var, "varId", None)
+                    vid = getattr(var, "Id", None) or getattr(
+                        var, "varId", None)
                     vtype = getattr(var, "valueType", None) or getattr(
                         var, "typeStartToken", None
                     )
@@ -1928,7 +1929,8 @@ class PointerAnalysis(DataflowAnalysis[PtsState]):
 
             state = dict(state)
             if s == "=":
-                state[lhs_vid] = targets if targets else frozenset({UNKNOWN_TARGET})
+                state[lhs_vid] = targets if targets else frozenset(
+                    {UNKNOWN_TARGET})
             else:
                 # Compound assignment (+=, etc.) — doesn't change pointer target
                 pass
@@ -2234,7 +2236,8 @@ def _taint_join(a: TaintState, b: TaintState) -> TaintState:
 
 def _taint_leq(a: TaintState, b: TaintState) -> bool:
     """a ⊑ b if for all vars, a[v] ≤ b[v] in the taint ordering."""
-    _ORDER = {TaintLevel.UNTAINTED: 0, TaintLevel.SANITISED: 1, TaintLevel.TAINTED: 2}
+    _ORDER = {TaintLevel.UNTAINTED: 0,
+              TaintLevel.SANITISED: 1, TaintLevel.TAINTED: 2}
     for vid, level in a.items():
         b_level = b.get(vid, TaintLevel.UNTAINTED)
         if _ORDER[level] > _ORDER[b_level]:
@@ -2418,8 +2421,10 @@ class TaintAnalysis(DataflowAnalysis[TaintState]):
         op1 = getattr(tok, "astOperand1", None)
         op2 = getattr(tok, "astOperand2", None)
         if op1 or op2:
-            t1 = self._eval_taint_expr(op1, state) if op1 else TaintLevel.UNTAINTED
-            t2 = self._eval_taint_expr(op2, state) if op2 else TaintLevel.UNTAINTED
+            t1 = self._eval_taint_expr(
+                op1, state) if op1 else TaintLevel.UNTAINTED
+            t2 = self._eval_taint_expr(
+                op2, state) if op2 else TaintLevel.UNTAINTED
             if t1 == TaintLevel.TAINTED or t2 == TaintLevel.TAINTED:
                 return TaintLevel.TAINTED
             if t1 == TaintLevel.SANITISED or t2 == TaintLevel.SANITISED:
@@ -2565,7 +2570,8 @@ class IntervalAnalysis(DataflowAnalysis[IntervalEnv]):
             func = getattr(self.scope, "function", None)
             if func:
                 for arg in getattr(func, "argument", {}).values():
-                    vid = getattr(arg, "Id", None) or getattr(arg, "varId", None)
+                    vid = getattr(arg, "Id", None) or getattr(
+                        arg, "varId", None)
                     if vid:
                         env = env.set(int(vid), IntervalDomain.top())
         return env
@@ -3080,7 +3086,8 @@ class NullPointerAnalysis(DataflowAnalysis[NullEnv]):
             if func:
                 for arg in getattr(func, "argument", {}).values():
                     var = getattr(arg, "variable", arg)
-                    vid = getattr(var, "Id", None) or getattr(var, "varId", None)
+                    vid = getattr(var, "Id", None) or getattr(
+                        var, "varId", None)
                     if vid:
                         vtype = getattr(var, "valueType", None)
                         if vtype and getattr(vtype, "pointer", 0) > 0:

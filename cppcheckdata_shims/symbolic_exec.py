@@ -337,7 +337,8 @@ class SymConst(SymExpr):
     __slots__ = ("value", "width", "_hash", "_simplified")
 
     def __init__(self, value: Union[int, float], width: int = 64) -> None:
-        self.value = int(value) if isinstance(value, float) and value == int(value) else value
+        self.value = int(value) if isinstance(
+            value, float) and value == int(value) else value
         self.width = width
         self._hash: Optional[int] = None
         self._simplified = False
@@ -996,7 +997,8 @@ class PathCondition:
     def __init__(
         self, constraints: Optional[List[SymExpr]] = None
     ) -> None:
-        self._constraints: List[SymExpr] = list(constraints) if constraints else []
+        self._constraints: List[SymExpr] = list(
+            constraints) if constraints else []
         self._simplified = False
 
     @property
@@ -1514,7 +1516,7 @@ class SymTransferFunction:
 
         # Compound assignment
         if tok.str in ("+=", "-=", "*=", "/=", "%=",
-                        "<<=", ">>=", "&=", "|=", "^="):
+                       "<<=", ">>=", "&=", "|=", "^="):
             return self._process_compound_assignment(tok, state)
 
         # Increment/decrement
@@ -2385,7 +2387,8 @@ class SymbolicExecutor:
         edges = getattr(node, "outgoing", []) or getattr(node, "out_edges", [])
         score = 0
         for edge in edges:
-            target = getattr(edge, "target", None) or getattr(edge, "dst", None)
+            target = getattr(edge, "target", None) or getattr(
+                edge, "dst", None)
             if target is not None:
                 tid = getattr(target, "id", target)
                 branch_key = (node_id, tid)
@@ -3407,7 +3410,8 @@ def execute_path(
 
                     if target_id == next_id:
                         edge_type = str(
-                            getattr(edge, "type", getattr(edge, "edge_type", ""))
+                            getattr(edge, "type", getattr(
+                                edge, "edge_type", ""))
                         ).upper()
                         if "FALSE" in edge_type:
                             state = state.add_constraint(

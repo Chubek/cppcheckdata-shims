@@ -73,40 +73,40 @@ from typing import (
 
 class LocationKind(enum.Enum):
     """Classification of memory locations."""
-    GLOBAL      = "global"       # Global / file-scope variable
-    LOCAL       = "local"        # Stack-allocated local variable
-    ARGUMENT    = "argument"     # Function parameter
-    HEAP        = "heap"         # Dynamically allocated (malloc/calloc/realloc/new)
-    FIELD       = "field"        # Struct/class field (offset from base)
-    ELEMENT     = "element"      # Array element (index from base)
-    RETURN      = "return"       # Function return value slot
-    UNKNOWN     = "unknown"      # Conservatively unknown location
-    NULL        = "null"         # The null/zero location
-    STRING_LIT  = "string_lit"   # String literal storage
+    GLOBAL = "global"       # Global / file-scope variable
+    LOCAL = "local"        # Stack-allocated local variable
+    ARGUMENT = "argument"     # Function parameter
+    HEAP = "heap"         # Dynamically allocated (malloc/calloc/realloc/new)
+    FIELD = "field"        # Struct/class field (offset from base)
+    ELEMENT = "element"      # Array element (index from base)
+    RETURN = "return"       # Function return value slot
+    UNKNOWN = "unknown"      # Conservatively unknown location
+    NULL = "null"         # The null/zero location
+    STRING_LIT = "string_lit"   # String literal storage
 
 
 class AllocatorKind(enum.Enum):
     """How a heap location was allocated."""
-    MALLOC      = "malloc"
-    CALLOC      = "calloc"
-    REALLOC     = "realloc"
-    NEW         = "new"
-    NEW_ARRAY   = "new[]"
-    STRDUP      = "strdup"
-    CUSTOM      = "custom"       # User-defined allocator
-    STACK       = "stack"        # Stack allocation (alloca / VLA)
-    STATIC      = "static"       # Static storage duration
-    UNKNOWN     = "unknown"
+    MALLOC = "malloc"
+    CALLOC = "calloc"
+    REALLOC = "realloc"
+    NEW = "new"
+    NEW_ARRAY = "new[]"
+    STRDUP = "strdup"
+    CUSTOM = "custom"       # User-defined allocator
+    STACK = "stack"        # Stack allocation (alloca / VLA)
+    STATIC = "static"       # Static storage duration
+    UNKNOWN = "unknown"
 
 
 class DeallocatorKind(enum.Enum):
     """How a heap location should be / was deallocated."""
-    FREE        = "free"
-    DELETE      = "delete"
+    FREE = "free"
+    DELETE = "delete"
     DELETE_ARRAY = "delete[]"
-    REALLOC     = "realloc"      # realloc can free the old block
-    CUSTOM      = "custom"
-    NONE        = "none"         # Not yet freed / not applicable
+    REALLOC = "realloc"      # realloc can free the old block
+    CUSTOM = "custom"
+    NONE = "none"         # Not yet freed / not applicable
 
 
 # Matching table: which deallocator is correct for each allocator
@@ -162,9 +162,11 @@ class MemoryLocation:
     """
     kind: LocationKind
     base_id: str                              # Unique base identifier
-    offset: Union[str, int, None] = None      # Field name, array index, or None
+    # Field name, array index, or None
+    offset: Union[str, int, None] = None
     alloc_site: Optional[AllocationSite] = None
-    variable_id: Optional[str] = None         # cppcheckdata Variable.Id if applicable
+    # cppcheckdata Variable.Id if applicable
+    variable_id: Optional[str] = None
     scope_id: Optional[str] = None            # Enclosing Scope.Id
     name: Optional[str] = None                # Human-readable name
 
@@ -240,17 +242,17 @@ UNKNOWN_LOCATION = MemoryLocation(
 
 class AbstractValueKind(enum.Enum):
     """Kind of abstract value stored in a memory cell."""
-    TOP         = "top"         # Any value (no information)
-    BOTTOM      = "bottom"      # Unreachable / uninitialized
-    CONCRETE    = "concrete"    # Known concrete integer/float
-    INTERVAL    = "interval"    # Numeric interval [lo, hi]
-    POINTER     = "pointer"     # Points-to set
-    SYMBOL      = "symbol"      # Symbolic variable (for symbolic execution)
-    NULL        = "null"        # Definitely null
-    NON_NULL    = "non_null"    # Definitely non-null (but unknown target)
-    MAYBE_NULL  = "maybe_null"  # May or may not be null
-    FREED       = "freed"       # Memory has been deallocated
-    UNINIT      = "uninit"      # Uninitialized memory
+    TOP = "top"         # Any value (no information)
+    BOTTOM = "bottom"      # Unreachable / uninitialized
+    CONCRETE = "concrete"    # Known concrete integer/float
+    INTERVAL = "interval"    # Numeric interval [lo, hi]
+    POINTER = "pointer"     # Points-to set
+    SYMBOL = "symbol"      # Symbolic variable (for symbolic execution)
+    NULL = "null"        # Definitely null
+    NON_NULL = "non_null"    # Definitely non-null (but unknown target)
+    MAYBE_NULL = "maybe_null"  # May or may not be null
+    FREED = "freed"       # Memory has been deallocated
+    UNINIT = "uninit"      # Uninitialized memory
 
 
 @dataclass(frozen=True)
@@ -404,8 +406,10 @@ class AbstractValue:
             hi_a = self.concrete_int if self.kind == AbstractValueKind.CONCRETE else self.interval_hi
             lo_b = other.concrete_int if other.kind == AbstractValueKind.CONCRETE else other.interval_lo
             hi_b = other.concrete_int if other.kind == AbstractValueKind.CONCRETE else other.interval_hi
-            lo = max(lo_a, lo_b) if lo_a is not None and lo_b is not None else (lo_a or lo_b)
-            hi = min(hi_a, hi_b) if hi_a is not None and hi_b is not None else (hi_a or hi_b)
+            lo = max(lo_a, lo_b) if lo_a is not None and lo_b is not None else (
+                lo_a or lo_b)
+            hi = min(hi_a, hi_b) if hi_a is not None and hi_b is not None else (
+                hi_a or hi_b)
             if lo is not None and hi is not None and lo > hi:
                 return AbstractValue.bottom()
             return AbstractValue.from_interval(lo, hi)
@@ -475,7 +479,8 @@ class AbstractStore:
     def __init__(self, mapping: Optional[Dict[MemoryLocation, AbstractValue]] = None):
         # Internally we use a plain dict; the "immutable" contract is
         # enforced by always copying on mutation.
-        self._map: Dict[MemoryLocation, AbstractValue] = dict(mapping) if mapping else {}
+        self._map: Dict[MemoryLocation, AbstractValue] = dict(
+            mapping) if mapping else {}
         self._hash_cache: Optional[int] = None
 
     # -- Read / Write --------------------------------------------------------
@@ -585,8 +590,10 @@ class AbstractStore:
                 lo_new = v_new.concrete_int if v_new.kind == AbstractValueKind.CONCRETE else v_new.interval_lo
                 hi_new = v_new.concrete_int if v_new.kind == AbstractValueKind.CONCRETE else v_new.interval_hi
                 # Widen: if lower bound decreased, go to -∞; if upper increased, go to +∞
-                lo = lo_old if (lo_new is not None and lo_old is not None and lo_new >= lo_old) else None
-                hi = hi_old if (hi_new is not None and hi_old is not None and hi_new <= hi_old) else None
+                lo = lo_old if (
+                    lo_new is not None and lo_old is not None and lo_new >= lo_old) else None
+                hi = hi_old if (
+                    hi_new is not None and hi_old is not None and hi_new <= hi_old) else None
                 widened = AbstractValue.from_interval(lo, hi)
                 if not widened.is_top():
                     result[k] = widened
@@ -650,7 +657,8 @@ class StackFrame:
     function_name: str
     function_id: Optional[str]            # Cppcheck Function.Id
     scope_id: Optional[str]               # Cppcheck Scope.Id of function body
-    call_site_token_id: Optional[str]     # Token.Id of the call site (None for entry)
+    # Token.Id of the call site (None for entry)
+    call_site_token_id: Optional[str]
     locals: Dict[str, MemoryLocation]     # variable_id → MemoryLocation
     return_loc: Optional[MemoryLocation]  # Where to write the return value
 
@@ -666,11 +674,11 @@ class StackFrame:
 
 class HeapStatus(enum.Enum):
     """Lifecycle state of a heap allocation."""
-    ALLOCATED   = "allocated"
-    FREED       = "freed"
-    REALLOC     = "reallocated"  # Original block freed by realloc
-    ESCAPED     = "escaped"      # Pointer escaped analysis scope
-    UNKNOWN     = "unknown"
+    ALLOCATED = "allocated"
+    FREED = "freed"
+    REALLOC = "reallocated"  # Original block freed by realloc
+    ESCAPED = "escaped"      # Pointer escaped analysis scope
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -683,8 +691,10 @@ class HeapBlock:
     status: HeapStatus = HeapStatus.ALLOCATED
     dealloc_site: Optional[AllocationSite] = None  # Where it was freed
     size: Optional[AbstractValue] = None           # Abstract size
-    refcount: int = 1                               # Number of live pointers (approximate)
-    escaped: bool = False                           # Has the pointer been passed externally
+    # Number of live pointers (approximate)
+    refcount: int = 1
+    # Has the pointer been passed externally
+    escaped: bool = False
 
     @property
     def is_live(self) -> bool:
@@ -724,9 +734,11 @@ class PointsToGraph:
 
     def __init__(self) -> None:
         # Adjacency: source_loc → set of target_locs
-        self._edges: Dict[MemoryLocation, Set[MemoryLocation]] = defaultdict(set)
+        self._edges: Dict[MemoryLocation,
+                          Set[MemoryLocation]] = defaultdict(set)
         # Reverse adjacency (for efficient lookup)
-        self._rev_edges: Dict[MemoryLocation, Set[MemoryLocation]] = defaultdict(set)
+        self._rev_edges: Dict[MemoryLocation,
+                              Set[MemoryLocation]] = defaultdict(set)
         # All nodes
         self._nodes: Set[MemoryLocation] = set()
 
@@ -820,7 +832,8 @@ class MemoryState:
     """
     store: AbstractStore = field(default_factory=AbstractStore)
     call_stack: List[StackFrame] = field(default_factory=list)
-    heap_blocks: Dict[str, HeapBlock] = field(default_factory=dict)  # base_id → HeapBlock
+    heap_blocks: Dict[str, HeapBlock] = field(
+        default_factory=dict)  # base_id → HeapBlock
     points_to: Optional[PointsToGraph] = None
 
     # -- High-level operations -----------------------------------------------
@@ -905,7 +918,8 @@ class MemoryState:
                 block.alloc_site.allocator, frozenset()
             )
             if dealloc_site.allocator != AllocatorKind.UNKNOWN:
-                dealloc_kind = _allocator_to_deallocator(dealloc_site.allocator)
+                dealloc_kind = _allocator_to_deallocator(
+                    dealloc_site.allocator)
                 if dealloc_kind and dealloc_kind not in valid_deallocs:
                     error = (f"Mismatched deallocation: {loc} allocated with "
                              f"{block.alloc_site.allocator.value} but freed with "
@@ -1030,7 +1044,8 @@ class MemoryState:
             elif b2:
                 merged_blocks[bid] = b2
         # Use the longer call stack (they should match at merge points)
-        stack = self.call_stack if len(self.call_stack) >= len(other.call_stack) else other.call_stack
+        stack = self.call_stack if len(self.call_stack) >= len(
+            other.call_stack) else other.call_stack
         return MemoryState(
             store=joined_store,
             call_stack=list(stack),
@@ -1071,9 +1086,11 @@ class LocationFactory:
     """
 
     def __init__(self) -> None:
-        self._var_cache: Dict[str, MemoryLocation] = {}       # Variable.Id → loc
+        # Variable.Id → loc
+        self._var_cache: Dict[str, MemoryLocation] = {}
         self._alloc_cache: Dict[str, MemoryLocation] = {}     # Token.Id → loc
-        self._return_cache: Dict[str, MemoryLocation] = {}    # Function.Id → return loc
+        # Function.Id → return loc
+        self._return_cache: Dict[str, MemoryLocation] = {}
         self._counter = itertools.count(0)
 
     def for_variable(self, variable) -> MemoryLocation:
@@ -1097,7 +1114,8 @@ class LocationFactory:
             kind=kind,
             base_id=f"var_{vid}",
             variable_id=vid,
-            scope_id=variable.scopeId if hasattr(variable, "scopeId") else None,
+            scope_id=variable.scopeId if hasattr(
+                variable, "scopeId") else None,
             name=name_str,
         )
         self._var_cache[vid] = loc
@@ -1296,14 +1314,15 @@ class PointsToBuilder:
 
     # Constraint kinds
     _ADDR_OF = 0   # pts(dst) ⊇ {src}
-    _COPY    = 1   # pts(dst) ⊇ pts(src)
-    _LOAD    = 2   # pts(dst) ⊇ pts(*src)
-    _STORE   = 3   # pts(*dst) ⊇ pts(src)
+    _COPY = 1   # pts(dst) ⊇ pts(src)
+    _LOAD = 2   # pts(dst) ⊇ pts(*src)
+    _STORE = 3   # pts(*dst) ⊇ pts(src)
 
     def __init__(self, cfg_data, location_factory: Optional[LocationFactory] = None) -> None:
         self._cfg = cfg_data
         self._loc_factory = location_factory or LocationFactory()
-        self._constraints: List[Tuple[int, MemoryLocation, MemoryLocation]] = []
+        self._constraints: List[Tuple[int,
+                                      MemoryLocation, MemoryLocation]] = []
         self._graph = PointsToGraph()
 
     @property
@@ -1503,8 +1522,10 @@ class MemoryModel:
         self._location_factory = LocationFactory()
         self._points_to_graph: Optional[PointsToGraph] = None
         self._may_mod: Optional[MayModAnalysis] = None
-        self._alloc_sites: Optional[List[Tuple[AllocationSite, Any]]] = None   # (site, token)
-        self._dealloc_sites: Optional[List[Tuple[DeallocatorKind, Any]]] = None  # (kind, token)
+        # (site, token)
+        self._alloc_sites: Optional[List[Tuple[AllocationSite, Any]]] = None
+        # (kind, token)
+        self._dealloc_sites: Optional[List[Tuple[DeallocatorKind, Any]]] = None
         self._built = False
 
     @property
@@ -1520,7 +1541,8 @@ class MemoryModel:
     @property
     def may_mod_analysis(self) -> MayModAnalysis:
         if self._may_mod is None:
-            raise RuntimeError("Call build() before accessing may_mod_analysis")
+            raise RuntimeError(
+                "Call build() before accessing may_mod_analysis")
         return self._may_mod
 
     def build(self) -> "MemoryModel":
@@ -1533,7 +1555,8 @@ class MemoryModel:
         self._points_to_graph = ptb.build()
 
         # Phase 2: May-mod analysis
-        self._may_mod = MayModAnalysis(self._points_to_graph, self._location_factory)
+        self._may_mod = MayModAnalysis(
+            self._points_to_graph, self._location_factory)
         self._build_may_mod()
 
         # Phase 3: Collect allocation / deallocation sites
@@ -1581,7 +1604,8 @@ class MemoryModel:
 
             # Direct modifications: assignments
             if token.isAssignmentOp and token.astOperand1 and token.astOperand1.variable:
-                loc = self._location_factory.for_variable(token.astOperand1.variable)
+                loc = self._location_factory.for_variable(
+                    token.astOperand1.variable)
                 self._may_mod.add_direct_mod(func_id, loc)
 
             # Store through pointer: *p = ...
@@ -1667,7 +1691,8 @@ class MemoryModel:
                         loc = self._location_factory.for_variable(arg_var)
                         # Parameters start as symbolic (unconstrained) values
                         if arg_var.isPointer:
-                            store = store.write(loc, AbstractValue.maybe_null())
+                            store = store.write(
+                                loc, AbstractValue.maybe_null())
                         else:
                             store = store.write(loc, AbstractValue.top())
                         frame_locals[arg_var.Id] = loc
@@ -1684,8 +1709,9 @@ class MemoryModel:
             scope_id=function_scope.Id if function_scope else None,
             call_site_token_id=None,
             locals=frame_locals,
-            return_loc=self._location_factory.for_return(function_scope.function)
-                       if function_scope and function_scope.function else None,
+            return_loc=self._location_factory.for_return(
+                function_scope.function)
+            if function_scope and function_scope.function else None,
         )
 
         return MemoryState(
@@ -1779,7 +1805,8 @@ def find_pointer_issues(cfg_data) -> List[Dict[str, Any]]:
                 tok = tok.next
 
     # -- Check allocator/deallocator matching --
-    alloc_map: Dict[str, Tuple[AllocatorKind, Any]] = {}  # var_id → (allocator, token)
+    # var_id → (allocator, token)
+    alloc_map: Dict[str, Tuple[AllocatorKind, Any]] = {}
 
     for site, token in model.find_allocation_sites():
         # Find the variable assigned to

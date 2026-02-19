@@ -1836,7 +1836,8 @@ def expr_to_string(tok: Token, max_depth: int = 50) -> str:
         # Function call
         if s == '(' and is_function_call(tok):
             args = get_call_arguments(tok)
-            args_str = ", ".join(expr_to_string(a, max_depth - 1) for a in args)
+            args_str = ", ".join(expr_to_string(a, max_depth - 1)
+                                 for a in args)
             return f"{left}({args_str})"
 
         # Member access

@@ -298,7 +298,7 @@ class CallString(CallingContext):
         """Push *call_site* and truncate to *k*."""
         new_sites = (*self.sites, call_site)
         if len(new_sites) > self.k:
-            new_sites = new_sites[-self.k :]
+            new_sites = new_sites[-self.k:]
         return CallString(sites=new_sites, k=self.k)
 
     def truncate(self, k: int) -> "CallString":
@@ -511,7 +511,8 @@ class InterproceduralCFG:
 
         for n in nodes:
             nid = self._nid(fid, n)
-            kind = "entry" if n == entry else ("exit" if n == exit_ else "normal")
+            kind = "entry" if n == entry else (
+                "exit" if n == exit_ else "normal")
             stmt_ref = self._node_stmt(local_cfg, n)
             self.nodes[nid] = ICFGNode(nid=nid, function=fid, kind=kind,
                                        stmt=stmt_ref)
@@ -1769,7 +1770,8 @@ def print_results(
         print("(no ICFG available)", file=out)
         return
 
-    target_funcs = set(functions) if functions else set(result.icfg.functions())
+    target_funcs = set(functions) if functions else set(
+        result.icfg.functions())
 
     for func in sorted(target_funcs, key=str):
         print(f"\n--- Function: {func} ---", file=out)
@@ -1798,4 +1800,3 @@ def print_results(
                 print(f"    {entry_key} → {tag}", file=out)
 
     print(f"\n{'='*40}", file=out)
-

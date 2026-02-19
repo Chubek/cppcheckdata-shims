@@ -248,7 +248,8 @@ class DistributiveFunction(Generic[D]):
 
     def __repr__(self):
         gen = sorted(str(e.tgt) for e in self._edges if e.src is _ZERO)
-        prop = sorted(f"{e.src}→{e.tgt}" for e in self._edges if e.src is not _ZERO)
+        prop = sorted(
+            f"{e.src}→{e.tgt}" for e in self._edges if e.src is not _ZERO)
         return f"DistFunc(gen={gen}, prop={prop})"
 
 
@@ -311,17 +312,22 @@ class Supergraph:
         self._config = configuration
         self._call_graph = call_graph or build_call_graph(configuration)
         self._cfgs: Dict[Any, CFG] = {}        # func_id → CFG
-        self._nodes: Dict[Any, SuperNode] = {}  # (func_id, block_id) → SuperNode
+        # (func_id, block_id) → SuperNode
+        self._nodes: Dict[Any, SuperNode] = {}
         self._edges: List[SuperEdge] = []
         self._succ: Dict[SuperNode, List[SuperEdge]] = defaultdict(list)
         self._pred: Dict[SuperNode, List[SuperEdge]] = defaultdict(list)
-        self._func_entries: Dict[Any, SuperNode] = {}  # func_id → entry SuperNode
-        self._func_exits: Dict[Any, SuperNode] = {}    # func_id → exit SuperNode
+        # func_id → entry SuperNode
+        self._func_entries: Dict[Any, SuperNode] = {}
+        # func_id → exit SuperNode
+        self._func_exits: Dict[Any, SuperNode] = {}
 
         # Call-site bookkeeping for the tabulation algorithm
         self._call_to_return_site: Dict[SuperNode, SuperNode] = {}
-        self._call_to_callee_entry: Dict[SuperNode, List[SuperNode]] = defaultdict(list)
-        self._exit_to_return_sites: Dict[SuperNode, List[Tuple[SuperNode, SuperNode]]] = defaultdict(list)
+        self._call_to_callee_entry: Dict[SuperNode,
+                                         List[SuperNode]] = defaultdict(list)
+        self._exit_to_return_sites: Dict[SuperNode,
+                                         List[Tuple[SuperNode, SuperNode]]] = defaultdict(list)
         #                           callee_exit → [(call_node, return_node), ...]
 
         self._build()
@@ -396,7 +402,8 @@ class Supergraph:
                             self._edges.append(c2s_edge)
                             self._succ[call_sn].append(c2s_edge)
                             self._pred[callee_entry].append(c2s_edge)
-                            self._call_to_callee_entry[call_sn].append(callee_entry)
+                            self._call_to_callee_entry[call_sn].append(
+                                callee_entry)
 
                         if callee_exit and callee_entry:
                             e2r_edge = SuperEdge(callee_exit, ret_sn,
@@ -580,14 +587,17 @@ class IFDSSolver(Generic[D]):
         self._path_edge: Dict[SuperNode, Set[Any]] = defaultdict(set)
 
         # Summary edges at call sites: (call_node, d₁) → (return_site, d₂)
-        self._summary_edge: Dict[Tuple[SuperNode, Any], Set[Tuple[SuperNode, Any]]] = defaultdict(set)
+        self._summary_edge: Dict[Tuple[SuperNode, Any],
+                                 Set[Tuple[SuperNode, Any]]] = defaultdict(set)
 
         # End-summary: for each callee, (exit_node, d₃) reached from (entry, d₁)
-        self._end_summary: Dict[Tuple[SuperNode, Any], Set[Any]] = defaultdict(set)
+        self._end_summary: Dict[Tuple[SuperNode, Any],
+                                Set[Any]] = defaultdict(set)
         #                       (callee_entry, d1) → {d3 at callee_exit}
 
         # Incoming: for each callee entry, the set of (call_node, d_caller)
-        self._incoming: Dict[Tuple[SuperNode, Any], Set[Tuple[SuperNode, Any]]] = defaultdict(set)
+        self._incoming: Dict[Tuple[SuperNode, Any],
+                             Set[Tuple[SuperNode, Any]]] = defaultdict(set)
 
         # Results: node → set of facts
         self._results: Dict[SuperNode, Set[D]] = defaultdict(set)
@@ -658,7 +668,7 @@ class IFDSSolver(Generic[D]):
                     # edge handles the callee bypass.  Skip to avoid
                     # double-processing.  (Only if a CALL_TO_RETURN exists.)
                     has_c2r = any(e.kind == EdgeKind.CALL_TO_RETURN
-                                 for e in self._sg.successors(n))
+                                  for e in self._sg.successors(n))
                     if has_c2r:
                         continue
 
@@ -674,7 +684,8 @@ class IFDSSolver(Generic[D]):
                     # Record incoming
                     self._incoming[(callee_entry, d3)].add((n, d2))
                     # Propagate into callee
-                    self._propagate(callee_entry, d3, callee_entry, d3, worklist)
+                    self._propagate(callee_entry, d3,
+                                    callee_entry, d3, worklist)
                     # Check if we already have end-summaries for this callee
                     callee_exit = self._sg.exit_of(callee_entry.function_id)
                     if callee_exit:
@@ -688,7 +699,8 @@ class IFDSSolver(Generic[D]):
                                     callee_exit, ret_site, n,
                                     ret_edge or edge)
                                 for d4 in self._apply_flow_to_fact(rff, d_exit):
-                                    self._propagate(sp, d1, ret_site, d4, worklist)
+                                    self._propagate(
+                                        sp, d1, ret_site, d4, worklist)
 
             elif edge.kind == EdgeKind.CALL_TO_RETURN:
                 # ── Call-to-return edge: bypass callee ────────────
@@ -719,7 +731,8 @@ class IFDSSolver(Generic[D]):
                                                    call_sn, edge)
                     for d4 in self._apply_flow_to_fact(rff, d2):
                         # Record summary edge
-                        self._summary_edge[(call_sn, d_caller)].add((ret_site, d4))
+                        self._summary_edge[(call_sn, d_caller)].add(
+                            (ret_site, d4))
                         # Propagate at return site using the caller's
                         # entry-point context
                         # We need to propagate for every path edge that
@@ -1099,7 +1112,8 @@ class IDESolver(Generic[D, V]):
         visited_edges: Set[Tuple[SuperNode, Any, SuperNode, Any]] = set()
 
         iterations = 0
-        max_iterations = len(ifds_results) * (len(self.problem.domain) + 1) * 10
+        max_iterations = len(ifds_results) * \
+            (len(self.problem.domain) + 1) * 10
 
         while worklist and iterations < max_iterations:
             iterations += 1
@@ -1238,7 +1252,8 @@ class PossiblyUninitializedIFDS(IFDSProblem[UninitFact]):
                         var.nameToken and var.nameToken.scope and
                         hasattr(var.nameToken.scope, 'function') and
                         var.nameToken.scope.function == func):
-                    fact = UninitFact(var.Id, getattr(var, 'name', str(var.Id)))
+                    fact = UninitFact(var.Id, getattr(
+                        var, 'name', str(var.Id)))
                     domain_facts.add(fact)
                     self._var_to_func[var.Id] = func.Id
 
@@ -1252,7 +1267,8 @@ class PossiblyUninitializedIFDS(IFDSProblem[UninitFact]):
                 self._func_locals[fid].add(fact)
 
         # Precompute: var_id → UninitFact
-        self._var_fact: Dict[Any, UninitFact] = {f.var_id: f for f in domain_facts}
+        self._var_fact: Dict[Any, UninitFact] = {
+            f.var_id: f for f in domain_facts}
 
         # Precompute: for each block, which variables it assigns
         self._block_kills: Dict[Tuple[Any, int], Set[UninitFact]] = {}
@@ -1359,7 +1375,8 @@ class TaintIFDS(IFDSProblem[TaintFact]):
         # Precompute per-block gen/kill for taint
         self._block_gen: Dict[Tuple[Any, int], Set[TaintFact]] = {}
         self._block_kill: Dict[Tuple[Any, int], Set[TaintFact]] = {}
-        self._block_propagate: Dict[Tuple[Any, int], Dict[TaintFact, Set[TaintFact]]] = {}
+        self._block_propagate: Dict[Tuple[Any, int],
+                                    Dict[TaintFact, Set[TaintFact]]] = {}
         self._sink_locations: List[Tuple[SuperNode, Any]] = []
         self._precompute(supergraph, configuration)
 
@@ -1392,7 +1409,8 @@ class TaintIFDS(IFDSProblem[TaintFact]):
                         if lhs and lhs.varId:
                             lhs_fact = self._var_fact.get(lhs.varId)
                             if lhs_fact:
-                                rhs_vars = self._collect_var_ids(tok.astOperand2)
+                                rhs_vars = self._collect_var_ids(
+                                    tok.astOperand2)
                                 rhs_facts = {self._var_fact[v] for v in rhs_vars
                                              if v in self._var_fact}
                                 if rhs_facts:
@@ -1554,9 +1572,11 @@ class CopyConstantPropagationIDE(IDEProblem[VarFact, Any]):
                                 # x = y (copy)
                                 rhs_fact = self._var_fact.get(rhs.varId)
                                 if rhs_fact:
-                                    assignments.append(('copy', lhs_fact, rhs_fact))
+                                    assignments.append(
+                                        ('copy', lhs_fact, rhs_fact))
                                 else:
-                                    assignments.append(('kill', lhs_fact, None))
+                                    assignments.append(
+                                        ('kill', lhs_fact, None))
                             else:
                                 # x = complex_expr → kill
                                 assignments.append(('kill', lhs_fact, None))
@@ -1675,7 +1695,7 @@ class IntraproceduralDistributiveAnalysis(Generic[D]):
             if block != entry:
                 IN[block.id] = frozenset()
             ff = self._flow_funcs.get(block.id,
-                                       DistributiveFunction.identity(self.domain))
+                                      DistributiveFunction.identity(self.domain))
             OUT[block.id] = ff.apply(IN[block.id])
 
         # Worklist iteration (reuses the RPO ordering from ctrlflow_graph)
@@ -1698,7 +1718,7 @@ class IntraproceduralDistributiveAnalysis(Generic[D]):
             IN[block.id] = new_in
 
             ff = self._flow_funcs.get(block.id,
-                                       DistributiveFunction.identity(self.domain))
+                                      DistributiveFunction.identity(self.domain))
             new_out = ff.apply(new_in)
 
             if new_out != OUT.get(block.id, frozenset()):

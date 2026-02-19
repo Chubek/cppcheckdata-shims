@@ -80,9 +80,9 @@ from typing import (
 class CallResolutionKind(enum.Enum):
     """How a call edge was resolved."""
 
-    DIRECT           = "direct"
+    DIRECT = "direct"
     FUNCTION_POINTER = "function-pointer"
-    UNRESOLVED       = "unresolved"
+    UNRESOLVED = "unresolved"
 
 
 # ---------------------------------------------------------------------------
@@ -92,10 +92,10 @@ class CallResolutionKind(enum.Enum):
 class NodeKind(enum.Enum):
     """Classification of a call-graph node."""
 
-    FUNCTION  = "function"      # A real function defined in the TU
-    EXTERNAL  = "external"      # A library/external function (declaration only)
-    UNKNOWN   = "unknown"       # Synthetic sink for unresolved calls
-    ENTRY     = "entry"         # Synthetic program entry (e.g. wraps main)
+    FUNCTION = "function"      # A real function defined in the TU
+    EXTERNAL = "external"      # A library/external function (declaration only)
+    UNKNOWN = "unknown"       # Synthetic sink for unresolved calls
+    ENTRY = "entry"         # Synthetic program entry (e.g. wraps main)
 
 
 # ---------------------------------------------------------------------------
@@ -497,10 +497,11 @@ class CallGraph:
         n_fptr = sum(1 for e in self.edges
                      if e.resolution == CallResolutionKind.FUNCTION_POINTER)
         n_unresolved = sum(1 for e in self.edges
-                          if e.resolution == CallResolutionKind.UNRESOLVED)
+                           if e.resolution == CallResolutionKind.UNRESOLVED)
         sccs = self.strongly_connected_components()
         n_recursive = sum(1 for scc in sccs if len(scc) > 1)
-        n_self_recursive = sum(1 for n in self.nodes.values() if n.is_recursive)
+        n_self_recursive = sum(
+            1 for n in self.nodes.values() if n.is_recursive)
         return {
             "functions": n_func,
             "external_functions": n_ext,
@@ -814,7 +815,7 @@ def _parse_fptr_signature_string(s: str) -> Optional[Tuple]:
     if param_end < 0:
         return (ret_type, ())
 
-    param_str = s[param_start + 1 : param_end].strip()
+    param_str = s[param_start + 1: param_end].strip()
     if not param_str or param_str == "void":
         return (ret_type, ())
 
@@ -928,7 +929,8 @@ def _detect_call_sites(cfg_config) -> List[_CallSite]:
                 cs.call_token = token
                 cs.callee_name = token.str
                 cs.callee_function = func_ref
-                cs.caller_function = _find_enclosing_function(token, cfg_config)
+                cs.caller_function = _find_enclosing_function(
+                    token, cfg_config)
                 cs.is_fptr_call = False
                 call_sites.append(cs)
                 continue
@@ -1210,7 +1212,8 @@ class _CallGraphBuilder:
         main_nodes = self.cg.functions_by_name("main")
         if main_nodes:
             for mn in main_nodes:
-                self.cg.add_edge(entry, mn, resolution=CallResolutionKind.DIRECT)
+                self.cg.add_edge(
+                    entry, mn, resolution=CallResolutionKind.DIRECT)
         else:
             # No main — connect entry to all roots (library code, etc.)
             for n in list(self.cg.nodes.values()):

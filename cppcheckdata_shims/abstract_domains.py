@@ -324,10 +324,10 @@ class FlatDomain(Generic[T]):
 
 class Sign(Enum):
     BOTTOM = auto()  # ⊥
-    NEG    = auto()  # ⁻
-    ZERO   = auto()  # 0
-    POS    = auto()  # ⁺
-    TOP    = auto()  # ⊤
+    NEG = auto()  # ⁻
+    ZERO = auto()  # 0
+    POS = auto()  # ⁺
+    TOP = auto()  # ⊤
 
 
 # Pre-computed join table.  Indexed as _SIGN_JOIN[a][b].
@@ -534,9 +534,9 @@ class SignDomain:
 
 class Parity(Enum):
     BOTTOM = auto()
-    EVEN   = auto()
-    ODD    = auto()
-    TOP    = auto()
+    EVEN = auto()
+    ODD = auto()
+    TOP = auto()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1164,6 +1164,7 @@ class IntervalDomain:
     def __repr__(self) -> str:
         if self.is_bottom():
             return "Interval(⊥)"
+
         def _fmt(v: float) -> str:
             if v == _NEG_INF:
                 return "-∞"
@@ -1525,7 +1526,8 @@ class BitfieldDomain:
         must0_self = ~self.may_one & _ALL_BITS  # bits definitely 0 in self
         must0_other = ~other.may_one & _ALL_BITS
         return BitfieldDomain(
-            must_one=(self.must_one & must0_other) | (other.must_one & must0_self),
+            must_one=(self.must_one & must0_other) | (
+                other.must_one & must0_self),
             may_one=(self.may_one | other.may_one),  # any bit *could* be 1
         )
 
@@ -1650,7 +1652,8 @@ class StridedIntervalDomain:
         if other.is_bottom():
             return self
         g = self._gcd(self.stride, other.stride)
-        lo_diff = abs(int(self.lo) - int(other.lo)) if math.isfinite(self.lo) and math.isfinite(other.lo) else 1
+        lo_diff = abs(int(self.lo) - int(other.lo)
+                      ) if math.isfinite(self.lo) and math.isfinite(other.lo) else 1
         g = self._gcd(g, lo_diff)
         new_stride = max(g, 1)
         return StridedIntervalDomain(
@@ -1715,6 +1718,7 @@ class StridedIntervalDomain:
     def __repr__(self) -> str:
         if self.is_bottom():
             return "StridedInterval(⊥)"
+
         def _fmt(v: float) -> str:
             if v == _NEG_INF:
                 return "-∞"
@@ -2296,7 +2300,8 @@ class FunctionDomain(Generic[D]):
     def __repr__(self) -> str:
         if not self.mapping:
             return "Env(⊤)"
-        entries = ", ".join(f"v{k}: {v!r}" for k, v in sorted(self.mapping.items()))
+        entries = ", ".join(f"v{k}: {v!r}" for k,
+                            v in sorted(self.mapping.items()))
         return f"Env({{{entries}}})"
 
 

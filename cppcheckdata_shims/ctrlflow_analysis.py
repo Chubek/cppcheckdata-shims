@@ -102,6 +102,7 @@ _SENTINEL = object()
 #  Utility: node id extraction
 # ===================================================================
 
+
 def _nid(node: CfgNode) -> Any:
     """Return a hashable id for a CFG node."""
     if hasattr(node, "id"):
@@ -843,7 +844,7 @@ class LoopInvariantAnalysis:
             return False
         pstr = getattr(parent, "str", "")
         if pstr in ("=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
-                     "<<=", ">>=", "++", "--"):
+                    "<<=", ">>=", "++", "--"):
             op1 = getattr(parent, "astOperand1", None)
             if op1 is tok:
                 return True
@@ -1601,7 +1602,8 @@ class PathSensitiveAnalysis:
                             condition_token_id=(_get_tok_id(cond_tok)
                                                 if cond_tok else nid),
                             branch_taken=branch_taken,
-                            text=getattr(cond_tok, "str", "") if cond_tok else "",
+                            text=getattr(cond_tok, "str",
+                                         "") if cond_tok else "",
                         )
                         new_ps = ps.with_condition(cond)
                         new_ps = self._check_feasibility(new_ps, cond_tok,
@@ -3105,4 +3107,3 @@ def run_all_ctrlflow_analysis(
         results["def_use"] = du
 
     return results
-

@@ -1176,6 +1176,7 @@ def _build_sign_arithmetic():
             _SIGN_MUL[(s, S.TOP)] = S.ZERO if s is S.ZERO else (
                 S.BOTTOM if s is S.BOTTOM else S.TOP)
 
+
 _build_sign_arithmetic()
 
 
@@ -1484,8 +1485,10 @@ class BitfieldDomain(AbstractDomain):
         if op == "^":
             # XOR: known if both bits are known
             both_known = (a.zeros | a.ones) & (b.zeros | b.ones)
-            result_ones = ((a.ones & b.zeros) | (a.zeros & b.ones)) & both_known
-            result_zeros = ((a.ones & b.ones) | (a.zeros & b.zeros)) & both_known
+            result_ones = ((a.ones & b.zeros) | (
+                a.zeros & b.ones)) & both_known
+            result_zeros = ((a.ones & b.ones) | (
+                a.zeros & b.zeros)) & both_known
             return BitfieldValue(
                 result_zeros & self._mask,
                 result_ones & self._mask,
@@ -1511,7 +1514,8 @@ class BitfieldDomain(AbstractDomain):
         if op == "<<":
             cv_b = b.constant_value
             if cv_b is not None and 0 <= cv_b < self.width:
-                new_zeros = ((a.zeros << cv_b) | ((1 << cv_b) - 1)) & self._mask
+                new_zeros = ((a.zeros << cv_b) | (
+                    (1 << cv_b) - 1)) & self._mask
                 new_ones = (a.ones << cv_b) & self._mask
                 return BitfieldValue(new_zeros, new_ones, self.width)
         if op == ">>":
@@ -2037,7 +2041,8 @@ class APRONDomain(AbstractDomain):
         self._var_to_dim: Dict[str, int] = {
             v: i for i, v in enumerate(self._variables)
         }
-        self._int_dims = int_dims if int_dims is not None else len(self._variables)
+        self._int_dims = int_dims if int_dims is not None else len(
+            self._variables)
         self._real_dims = real_dims
         self._apron = None
         self._manager = None
@@ -2524,8 +2529,10 @@ class CExpressionEvaluator:
                 # op2 is the ':' operator with true/false branches
                 colon = op2
                 if colon is not None and getattr(colon, "str", "") == ":":
-                    true_val = self.evaluate(getattr(colon, "astOperand1", None))
-                    false_val = self.evaluate(getattr(colon, "astOperand2", None))
+                    true_val = self.evaluate(
+                        getattr(colon, "astOperand1", None))
+                    false_val = self.evaluate(
+                        getattr(colon, "astOperand2", None))
                     return self.domain.join(true_val, false_val)
                 return self.domain.top()
 
@@ -2599,7 +2606,7 @@ class CTransferFunction:
 
         # Compound assignment: x += expr, etc.
         if tok.str in ("+=", "-=", "*=", "/=", "%=",
-                        "<<=", ">>=", "&=", "|=", "^="):
+                       "<<=", ">>=", "&=", "|=", "^="):
             return self._process_compound_assignment(tok, state)
 
         # Increment/decrement
@@ -2767,7 +2774,8 @@ class ConditionRefiner:
         AbstractState
             The refined state at the edge's target node.
         """
-        edge_type = getattr(edge, "type", None) or getattr(edge, "edge_type", None)
+        edge_type = getattr(edge, "type", None) or getattr(
+            edge, "edge_type", None)
         if edge_type is None:
             return state
 
@@ -2783,7 +2791,8 @@ class ConditionRefiner:
         condition = getattr(edge, "condition", None)
         if condition is None:
             # Try to get from source node
-            source = getattr(edge, "source", None) or getattr(edge, "src", None)
+            source = getattr(edge, "source", None) or getattr(
+                edge, "src", None)
             if source is not None:
                 condition = getattr(source, "condition", None)
 
@@ -3111,7 +3120,7 @@ class AbstractInterpreter:
             self._check_div_by_zero(tok, state)
 
         if self.check_overflow and tok.str in ("+", "-", "*", "++", "--",
-                                                 "+=", "-=", "*="):
+                                               "+=", "-=", "*="):
             self._check_integer_overflow(tok, state)
 
         if self.check_null_deref and tok.str in ("*", "->", "["):
@@ -3127,7 +3136,8 @@ class AbstractInterpreter:
         divisor_val = evaluator.evaluate(divisor_tok)
 
         if self.domain.may_be_zero(divisor_val):
-            severity = "error" if self.domain.must_be_zero(divisor_val) else "warning"
+            severity = "error" if self.domain.must_be_zero(
+                divisor_val) else "warning"
             msg = (
                 f"Division by zero: divisor "
                 f"'{getattr(divisor_tok, 'str', '?')}' "
@@ -3163,7 +3173,8 @@ class AbstractInterpreter:
 
         if op2 is not None:
             val2 = evaluator.evaluate(op2)
-            result = self.domain.abstract_binary(tok.str.rstrip("="), val1, val2)
+            result = self.domain.abstract_binary(
+                tok.str.rstrip("="), val1, val2)
         else:
             result = self.domain.abstract_unary(tok.str, val1)
 
