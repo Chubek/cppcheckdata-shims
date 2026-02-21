@@ -33,5 +33,10 @@ This library is the intellectual property of Poyan Afzar. It is released under t
 
 The *vade mecum* for the library is available at `docs/SHIMS_VADE_MECUM.md`. But if you wish to build the library's *canonical* documentation, you can run `make html` or `make pdf` or `make latex`, or several other formats listed under `generate-docs.sh`. Make sure to run `pip3 install -r docs/requirements.txt` before attempting to build these documentation.
 
+An easy way to lint a file is to follow the following sequence of commands:
+```sh
+$ cppcheck --dump foo.c
+$ PYTHONPATH="$PYTHONPATH:deps" liblint/integer-lint/IntegerLint.py foo.c.dump
+```
 
-
+You need to `cd(1)` into the root directory, the directory this very file is located at. 
