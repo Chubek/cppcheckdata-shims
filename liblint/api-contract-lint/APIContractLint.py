@@ -52,7 +52,7 @@ from typing import (
 # ═══════════════════════════════════════════════════════════════════════════
 
 __addon_name__ = "APIContractLint"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __description__ = "Detects C/C++ API contract violations and resource lifecycle errors"
 __cwe_coverage__ = [252, 401, 415, 416, 476, 628, 666, 675, 690, 789]
 
@@ -149,7 +149,6 @@ class ResourceInfo:
 
 # Maps acquire-function → (ResourceKind, "which output")
 # "return" means the return value holds the resource
-# An integer means that argument index is an output parameter
 ACQUIRE_FUNCTIONS: Dict[str, Tuple[ResourceKind, Any]] = {
     # Heap
     "malloc":  (ResourceKind.HEAP_MEMORY, "return"),
@@ -251,7 +250,7 @@ NONNULL_ARGS: Dict[str, List[Tuple[int, str]]] = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PART 2 — TOKEN HELPERS
+#  PART 2 — TOKEN / AST HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _is_function_call(token) -> bool:
@@ -323,12 +322,6 @@ def _var_name_for_id(cfg, var_id: int) -> str:
     """Look up the variable name from a Configuration's variable list."""
     if var_id == 0:
         return "?"
-    for var in cfg.variables:
-        if hasattr(var, 'Id') and var.Id == str(var_id):
-            return getattr(var, 'nameToken', var).str if hasattr(var, 'nameToken') and var.nameToken else "?"
-        if hasattr(var, 'nameTokenId'):
-            pass  # Alternative lookup
-    # Fallback: search the token list
     for tok in cfg.tokenlist:
         if hasattr(tok, 'varId') and tok.varId == var_id and tok.isName:
             return tok.str
@@ -342,46 +335,114 @@ def _token_loc(token) -> str:
     return f"{f}:{l}"
 
 
-def _is_null_check_before(token, var_id: int) -> bool:
+def _climb_to_assignment(token):
     """
-    Heuristic: walk backwards from *token* looking for a comparison of
-    var_id against NULL/0 (e.g., ``if (ptr == NULL)`` or ``if (!ptr)``).
-    Stops at the beginning of the current function scope.
+    From a function-name token, climb the AST to find the enclosing
+    assignment operator and return (assignment_token, lhs_token).
+
+    Cppcheck AST for ``x = malloc(10)`` typically looks like:
+
+        =              ← assignment
+       / \\
+      x    (           ← call operator
+          / \\
+       malloc  10
+
+    So token ('malloc') → parent is '(' → parent is '='.
+    In some dumps the function token itself may be the child of '='.
+
+    Returns (assign_tok, lhs_tok) or (None, None) if not inside an
+    assignment.
     """
-    current = token.previous
-    depth = 0
+    current = token
+    # Walk up at most a few levels
+    for _ in range(5):
+        parent = current.astParent
+        if parent is None:
+            return (None, None)
+        if parent.isAssignmentOp:
+            lhs = parent.astOperand1
+            return (parent, lhs)
+        current = parent
+    return (None, None)
+
+
+def _is_return_value_used(token) -> bool:
+    """
+    Check whether a function call's return value is used in *any* way
+    (assigned, compared, passed as argument, etc.).
+
+    If astParent is None at every level → discarded.
+    """
+    current = token
+    for _ in range(5):
+        parent = current.astParent
+        if parent is None:
+            return False
+        # If the parent is a statement-terminating ';', return value
+        # is not used.  But cppcheckdata doesn't represent ';' as a
+        # token.  Instead, if the top-level AST root has no further
+        # parent, the call IS the whole expression-statement.
+        # However, if the parent is '(' that means the function call
+        # itself — keep climbing.
+        if parent.str == '(' and parent.astOperand1 == current:
+            # This is the call-expression parenthesis wrapping us
+            current = parent
+            continue
+        # Any other parent means the value is being used
+        return True
+    return False
+
+
+def _find_var_id_usage_as_comparison(token_start, var_id: int,
+                                      max_steps: int = 500) -> bool:
+    """
+    Walk forward from *token_start* looking for any comparison that
+    involves var_id against NULL/0/nullptr, or a negation/bare-if check.
+
+    This scans the raw token stream (not AST), which is more robust
+    for finding patterns like:
+        if (ptr == NULL)
+        if (ptr != NULL)
+        if (!ptr)
+        if (ptr)
+        ptr == NULL
+    """
+    current = token_start.next
     steps = 0
-    max_steps = 200  # Don't scan too far
+    scope_depth = 0
 
     while current is not None and steps < max_steps:
         steps += 1
 
-        # Stop at function-level braces
-        if current.str == '{' and depth == 0:
-            break
-        if current.str == '}':
-            depth += 1
+        # Track scope depth — stop at end of enclosing function
         if current.str == '{':
-            depth -= 1
+            scope_depth += 1
+        elif current.str == '}':
+            if scope_depth == 0:
+                break
+            scope_depth -= 1
 
-        # Pattern: ``if ( varName == NULL )`` or ``if ( varName != NULL )``
+        vid = _expr_var_id(current)
+
+        # Pattern 1: direct AST comparison  var == NULL / var != NULL
         if current.isComparisonOp and current.str in ('==', '!='):
             op1 = current.astOperand1
             op2 = current.astOperand2
             if op1 and op2:
                 if (_expr_var_id(op1) == var_id and
-                    (op2.str == '0' or op2.str == 'NULL' or op2.str == 'nullptr')):
+                        _is_null_literal(op2)):
                     return True
                 if (_expr_var_id(op2) == var_id and
-                    (op1.str == '0' or op1.str == 'NULL' or op1.str == 'nullptr')):
+                        _is_null_literal(op1)):
                     return True
 
-        # Pattern: ``if ( ! varName )`` or ``if ( varName )``
+        # Pattern 2: negation  !ptr
         if current.str == '!' and current.astOperand1:
             if _expr_var_id(current.astOperand1) == var_id:
                 return True
 
-        # Pattern: bare ``if ( varName )``
+        # Pattern 3: bare-if  "if ( ptr )" — look at token stream
         if current.str == 'if':
             nxt = current.next
             if nxt and nxt.str == '(':
@@ -389,9 +450,16 @@ def _is_null_check_before(token, var_id: int) -> bool:
                 if inner and _expr_var_id(inner) == var_id:
                     return True
 
-        current = current.previous
+        current = current.next
 
     return False
+
+
+def _is_null_literal(token) -> bool:
+    """Check whether a token is NULL / 0 / nullptr."""
+    if token is None:
+        return False
+    return token.str in ('0', 'NULL', 'nullptr')
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -407,8 +475,6 @@ def check_resource_lifecycle(cfg) -> List[dict]:
         - CWE-415  Double free
         - CWE-416  Use after free
         - CWE-401  Memory leak (acquired but never released in scope)
-        - CWE-666  Operation on resource in wrong phase
-        - CWE-675  Duplicate operation on resource
 
     Args:
         cfg: cppcheckdata.Configuration
@@ -431,20 +497,10 @@ def check_resource_lifecycle(cfg) -> List[dict]:
             kind, output = ACQUIRE_FUNCTIONS[func_name]
 
             if output == "return":
-                # Find the variable assigned the return value:
-                # pattern ``var = func(...)``  →  the '=' is astParent of func
-                assign_tok = token.astParent
-                if assign_tok is None:
-                    # Return value discarded — that's CWE-252
-                    continue  # handled by check_unchecked_return
-
-                # Walk to the LHS of the assignment
-                lhs = assign_tok.astOperand1 if assign_tok and assign_tok.isAssignmentOp else None
-                if lhs is None:
-                    # Might be inside a larger expression; try parent
-                    if assign_tok and assign_tok.str == '(':
-                        # func() used as argument — no variable
-                        continue
+                # Climb AST to find assignment LHS
+                assign_tok, lhs = _climb_to_assignment(token)
+                if assign_tok is None or lhs is None:
+                    # Return value discarded — handled by check_unchecked_return
                     continue
 
                 vid = _expr_var_id(lhs)
@@ -490,7 +546,8 @@ def check_resource_lifecycle(cfg) -> List[dict]:
                             "cwe":      415,
                             "message":  (
                                 f"Double free of '{res.var_name}'. "
-                                f"Previously released at {res.release_file}:{res.release_line}."
+                                f"Previously released at "
+                                f"{res.release_file}:{res.release_line}."
                             ),
                         })
                         res.state = ResourceState.ERROR
@@ -499,7 +556,7 @@ def check_resource_lifecycle(cfg) -> List[dict]:
                         res.release_file = token.file or ""
                         res.release_line = token.linenr or 0
                 else:
-                    # First time we see this variable being released — track it
+                    # First time we see this variable being released
                     resources[vid] = ResourceInfo(
                         kind=kind,
                         state=ResourceState.RELEASED,
@@ -510,14 +567,13 @@ def check_resource_lifecycle(cfg) -> List[dict]:
                     )
 
         # ── USE (any function call that passes a tracked resource) ───
-        # We check each argument: if it references a released resource → CWE-416
         for i, arg in enumerate(args):
             vid = _expr_var_id(arg)
             if vid == 0:
                 continue
             if vid in resources and resources[vid].state == ResourceState.RELEASED:
-                # Skip if the function IS the release function and this IS the
-                # release argument (already handled above)
+                # Skip if the function IS the release function and this IS
+                # the release argument (already handled above)
                 if func_name in RELEASE_FUNCTIONS:
                     _, release_arg_idx = RELEASE_FUNCTIONS[func_name]
                     if i == release_arg_idx:
@@ -538,39 +594,40 @@ def check_resource_lifecycle(cfg) -> List[dict]:
 
     # ── End-of-scope leak detection (CWE-401) ────────────────────────
     for vid, res in resources.items():
-        if res.state == ResourceState.ACQUIRED and res.kind == ResourceKind.HEAP_MEMORY:
-            findings.append({
-                "file":     res.acquire_file,
-                "line":     res.acquire_line,
-                "severity": "warning",
-                "id":       "memoryLeak",
-                "cwe":      401,
-                "message":  (
-                    f"Potential memory leak: '{res.var_name}' allocated here "
-                    f"is never freed in the analyzed scope."
-                ),
-            })
-        elif res.state == ResourceState.ACQUIRED and res.kind in (
-            ResourceKind.FILE_HANDLE, ResourceKind.FILE_DESCRIPTOR,
-            ResourceKind.DIR_HANDLE, ResourceKind.SOCKET,
-        ):
-            kind_label = {
-                ResourceKind.FILE_HANDLE: "file handle",
-                ResourceKind.FILE_DESCRIPTOR: "file descriptor",
-                ResourceKind.DIR_HANDLE: "directory handle",
-                ResourceKind.SOCKET: "socket",
-            }.get(res.kind, "resource")
-            findings.append({
-                "file":     res.acquire_file,
-                "line":     res.acquire_line,
-                "severity": "warning",
-                "id":       "resourceLeak",
-                "cwe":      401,
-                "message":  (
-                    f"Potential {kind_label} leak: '{res.var_name}' opened here "
-                    f"is never closed in the analyzed scope."
-                ),
-            })
+        if res.state in (ResourceState.ACQUIRED, ResourceState.IN_USE):
+            if res.kind == ResourceKind.HEAP_MEMORY:
+                findings.append({
+                    "file":     res.acquire_file,
+                    "line":     res.acquire_line,
+                    "severity": "warning",
+                    "id":       "memoryLeak",
+                    "cwe":      401,
+                    "message":  (
+                        f"Potential memory leak: '{res.var_name}' allocated "
+                        f"here is never freed in the analyzed scope."
+                    ),
+                })
+            elif res.kind in (
+                ResourceKind.FILE_HANDLE, ResourceKind.FILE_DESCRIPTOR,
+                ResourceKind.DIR_HANDLE, ResourceKind.SOCKET,
+            ):
+                kind_label = {
+                    ResourceKind.FILE_HANDLE: "file handle",
+                    ResourceKind.FILE_DESCRIPTOR: "file descriptor",
+                    ResourceKind.DIR_HANDLE: "directory handle",
+                    ResourceKind.SOCKET: "socket",
+                }.get(res.kind, "resource")
+                findings.append({
+                    "file":     res.acquire_file,
+                    "line":     res.acquire_line,
+                    "severity": "warning",
+                    "id":       "resourceLeak",
+                    "cwe":      401,
+                    "message":  (
+                        f"Potential {kind_label} leak: '{res.var_name}' "
+                        f"opened here is never closed in the analyzed scope."
+                    ),
+                })
 
     return findings
 
@@ -581,14 +638,11 @@ def check_unchecked_return(cfg) -> List[dict]:
 
     Covers CWE-252 and CWE-690.
 
-    Strategy: for every call to a MUST_CHECK_RETURN function,
-    verify that the return value is either:
-      a) assigned to a variable AND that variable is later compared
-         against NULL/0, or
-      b) used directly in a conditional (e.g., ``if (fopen(...))``)
-
-    A simpler heuristic is used here: if the call's astParent is NOT
-    an assignment or conditional, the return value is discarded.
+    Strategy:
+      1. If the return value is completely discarded → always report.
+      2. If the return value is assigned to a variable, scan *forward*
+         from the assignment for a NULL/error check.  If none is found
+         within the enclosing scope → report.
 
     Args:
         cfg: cppcheckdata.Configuration
@@ -607,10 +661,9 @@ def check_unchecked_return(cfg) -> List[dict]:
             continue
 
         cwe, reason = MUST_CHECK_RETURN[func_name]
-        parent = token.astParent
 
-        # Case 1: return value completely discarded (no parent assignment)
-        if parent is None:
+        # ── Case 1: Is the return value used at all? ─────────────────
+        if not _is_return_value_used(token):
             findings.append({
                 "file":     token.file,
                 "line":     token.linenr,
@@ -624,84 +677,34 @@ def check_unchecked_return(cfg) -> List[dict]:
             })
             continue
 
-        # Case 2: used in expression — check if parent is assignment
-        if parent.isAssignmentOp:
-            lhs = parent.astOperand1
+        # ── Case 2: Assigned to a variable — check for NULL test ─────
+        assign_tok, lhs = _climb_to_assignment(token)
+        if assign_tok is not None and lhs is not None:
             vid = _expr_var_id(lhs)
-            if vid and not _is_null_check_before(cfg.tokenlist[-1], vid):
-                # No NULL check found after assignment within the scope
-                # (this is a heuristic — walk *forward* too)
-                if not _null_check_after(token, vid):
-                    findings.append({
-                        "file":     token.file,
-                        "line":     token.linenr,
-                        "severity": "warning",
-                        "id":       f"uncheckedReturnAssign_{func_name}",
-                        "cwe":      690 if cwe == 690 else 252,
-                        "message":  (
-                            f"Return value of {func_name}() assigned to "
-                            f"'{_expr_text(lhs)}' but never checked for "
-                            f"NULL/error. {func_name}() {reason}."
-                        ),
-                    })
+            if vid and not _find_var_id_usage_as_comparison(
+                    assign_tok, vid):
+                findings.append({
+                    "file":     token.file,
+                    "line":     token.linenr,
+                    "severity": "warning",
+                    "id":       f"uncheckedReturnAssign_{func_name}",
+                    "cwe":      690 if cwe == 690 else 252,
+                    "message":  (
+                        f"Return value of {func_name}() assigned to "
+                        f"'{_expr_text(lhs)}' but never checked for "
+                        f"NULL/error. {func_name}() {reason}."
+                    ),
+                })
             continue
 
-        # Case 3: used inside a conditional — considered checked
-        if parent.str in ('!', '==', '!=', '<', '>', '<=', '>=', '&&', '||'):
-            continue  # OK — it's being compared
-
-        # Case 4: used as argument to another function — might or might not
-        # be checked.  Flag conservatively at lower severity.
-        if parent.str == '(':
-            continue  # Pass through — we don't flag this
+        # ── Case 3: Used inside a conditional expression ─────────────
+        # If we got here the value is used (Case 1 didn't trigger) but
+        # not directly assigned.  It may be inside ``if(malloc(...))``
+        # or passed to another function.  We consider conditional use
+        # as checked and function-argument use as acceptable (the
+        # callee presumably checks).
 
     return findings
-
-
-def _null_check_after(token, var_id: int, max_steps: int = 300) -> bool:
-    """Walk forward from *token* looking for a NULL check on var_id."""
-    current = token.next
-    steps = 0
-    depth = 0
-
-    while current is not None and steps < max_steps:
-        steps += 1
-
-        if current.str == '{':
-            depth += 1
-        elif current.str == '}':
-            if depth == 0:
-                break
-            depth -= 1
-
-        # Comparison with NULL/0
-        if current.isComparisonOp and current.str in ('==', '!='):
-            op1 = current.astOperand1
-            op2 = current.astOperand2
-            if op1 and op2:
-                if (_expr_var_id(op1) == var_id and
-                    op2.str in ('0', 'NULL', 'nullptr')):
-                    return True
-                if (_expr_var_id(op2) == var_id and
-                    op1.str in ('0', 'NULL', 'nullptr')):
-                    return True
-
-        # Negation check: ``if (!ptr)``
-        if current.str == '!' and current.astOperand1:
-            if _expr_var_id(current.astOperand1) == var_id:
-                return True
-
-        # Bare ``if (ptr)``
-        if current.str == 'if':
-            nxt = current.next
-            if nxt and nxt.str == '(':
-                inner = nxt.next
-                if inner and _expr_var_id(inner) == var_id:
-                    return True
-
-        current = current.next
-
-    return False
 
 
 def check_argument_contracts(cfg) -> List[dict]:
@@ -731,14 +734,10 @@ def check_argument_contracts(cfg) -> List[dict]:
             if lhs and rhs:
                 vid = _expr_var_id(lhs)
                 if vid:
-                    if rhs.str in ('0', 'NULL', 'nullptr'):
+                    if _is_null_literal(rhs):
                         null_vars.add(vid)
-                    elif rhs.isName and rhs.str not in ('0', 'NULL', 'nullptr'):
+                    else:
                         null_vars.discard(vid)  # reassigned
-
-        # Track release — after free(ptr), ptr is effectively dangling,
-        # but not necessarily NULL.  Some code sets ptr=NULL after free.
-        # We already handle use-after-free above; skip here.
 
         if not _is_function_call(token):
             continue
@@ -769,7 +768,7 @@ def check_argument_contracts(cfg) -> List[dict]:
                 if arg_idx < len(args):
                     arg = args[arg_idx]
                     # Explicit NULL literal
-                    if arg.str in ('0', 'NULL', 'nullptr'):
+                    if _is_null_literal(arg):
                         findings.append({
                             "file":     token.file,
                             "line":     token.linenr,
@@ -777,8 +776,9 @@ def check_argument_contracts(cfg) -> List[dict]:
                             "id":       f"nullArgument_{func_name}",
                             "cwe":      476,
                             "message":  (
-                                f"NULL passed as {param_desc} (argument {arg_idx}) "
-                                f"to {func_name}() which requires non-null."
+                                f"NULL passed as {param_desc} "
+                                f"(argument {arg_idx}) to {func_name}() "
+                                f"which requires non-null."
                             ),
                         })
                     # Variable known to be NULL
@@ -790,9 +790,9 @@ def check_argument_contracts(cfg) -> List[dict]:
                             "id":       f"possibleNullArgument_{func_name}",
                             "cwe":      476,
                             "message":  (
-                                f"'{_expr_text(arg)}' may be NULL when passed "
-                                f"as {param_desc} (argument {arg_idx}) "
-                                f"to {func_name}()."
+                                f"'{_expr_text(arg)}' may be NULL when "
+                                f"passed as {param_desc} (argument "
+                                f"{arg_idx}) to {func_name}()."
                             ),
                         })
 
@@ -803,7 +803,7 @@ def check_argument_contracts(cfg) -> List[dict]:
 #  PART 4 — TAINT-BASED SIZE VALIDATION (CWE-789)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_api_contract_taint_config() -> Optional[TaintConfig]:
+def build_api_contract_taint_config() -> Optional["TaintConfig"]:
     """
     Build a taint config focused on detecting tainted allocation sizes.
 
@@ -840,7 +840,6 @@ def build_api_contract_taint_config() -> Optional[TaintConfig]:
     ]
 
     for func, arg_idx, kind, cwe, sev in size_sinks:
-        # Only add if not already present (default config may have some)
         if not config.is_sink(func):
             config.add_sink(TaintSink(
                 function=func,
@@ -864,7 +863,8 @@ def build_api_contract_taint_config() -> Optional[TaintConfig]:
             function=func,
             argument_index=0,
             sanitizes_return=True,
-            valid_for_sinks=frozenset({SinkKind.MEMORY_ALLOCATION, SinkKind.BUFFER_SIZE}),
+            valid_for_sinks=frozenset(
+                {SinkKind.MEMORY_ALLOCATION, SinkKind.BUFFER_SIZE}),
             description=f"Size validation via {func}()",
         ))
 
@@ -900,8 +900,9 @@ def check_tainted_sizes(cfg) -> List[dict]:
             "id":       f"taintedApiArg_{v.sink.function}",
             "cwe":      v.cwe or 789,
             "message":  (
-                f"Tainted (user-controlled) data from {{{', '.join(v.taint_sources)}}} "
-                f"reaches {v.sink.function}() argument {v.sink.argument_index} "
+                f"Tainted (user-controlled) data from "
+                f"{{{', '.join(v.taint_sources)}}} reaches "
+                f"{v.sink.function}() argument {v.sink.argument_index} "
                 f"without validation. {v.sink.description or ''}"
             ),
         })
@@ -923,7 +924,6 @@ def output_text(findings: List[dict]) -> None:
         print("APIContractLint: no issues found.")
         return
 
-    # Sort: errors first, then by file/line
     findings.sort(key=lambda f: (_severity_order(f["severity"]),
                                   f.get("file", ""), f.get("line", 0)))
 
@@ -966,7 +966,8 @@ def output_sarif(findings: List[dict]) -> None:
                 "name": rule_id,
                 "shortDescription": {"text": f["message"].split(".")[0]},
                 "defaultConfiguration": {
-                    "level": "error" if f["severity"] == "error" else "warning"
+                    "level": ("error" if f["severity"] == "error"
+                              else "warning")
                 },
                 "properties": {},
             }
@@ -975,19 +976,23 @@ def output_sarif(findings: List[dict]) -> None:
 
         results.append({
             "ruleId": rule_id,
-            "level": "error" if f["severity"] == "error" else "warning",
+            "level": ("error" if f["severity"] == "error" else "warning"),
             "message": {"text": f["message"]},
             "locations": [{
                 "physicalLocation": {
-                    "artifactLocation": {"uri": f.get("file", "?")},
+                    "artifactLocation": {
+                        "uri": f.get("file", "?")
+                    },
                     "region": {"startLine": f.get("line", 1)},
                 }
             }],
         })
 
     sarif = {
-        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/"
-                   "Schemata/sarif-schema-2.1.0.json",
+        "$schema": (
+            "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/"
+            "master/Schemata/sarif-schema-2.1.0.json"
+        ),
         "version": "2.1.0",
         "runs": [{
             "tool": {
@@ -1061,8 +1066,10 @@ def _main() -> None:
         description=f"{__addon_name__} v{__version__} — {__description__}",
         epilog="Generate dump files with: cppcheck --dump <source.c>",
     )
-    parser.add_argument("dumpfile", help="Cppcheck .dump file to analyze")
-    parser.add_argument("--json", action="store_true", dest="json_output",
+    parser.add_argument("dumpfile",
+                        help="Cppcheck .dump file to analyze")
+    parser.add_argument("--json", action="store_true",
+                        dest="json_output",
                         help="Output results in JSON format")
     parser.add_argument("--sarif", action="store_true",
                         help="Output results in SARIF 2.1.0 format")
@@ -1073,7 +1080,8 @@ def _main() -> None:
 
     if not TAINT_AVAILABLE:
         sys.stderr.write(
-            f"Warning: taint analysis unavailable ({_taint_import_error}). "
+            f"Warning: taint analysis unavailable "
+            f"({_taint_import_error}). "
             f"CWE-789 checks will be skipped.\n\n"
         )
 
