@@ -1,42 +1,53 @@
-# Cppcheck Addon API Shims
+# Cppcheck Addon API Shims & the Lint Library Based Upon it
 
-The default API provided by Cppcheck for writing addons, `cppcheckdata.py`, leaves a lot to be desired. It is merely a parser for the XML 'dump files' that the program generates with the `--dump` flag. This library creates a very rich abstraction layer on top of this API, what is colliqually referred to as a "shim" library. Do not mistake a "shim" with a "polyfill". A polyfill creates a *compatiblity layer* on top of an API or a language, whereas a shim provides *features* that do not exist by default in that API or language.
+This is home to `cppcheckdata-shims` library, and the `liblint` substrate.
 
-I recommend installing this library in a virtual environment:
+The Cppcheck addon API, shipped alongside the analyzer in `addons/cppcheckdata.py`, leave *a lot* to be desired in terms of carrying the addon from its provenance to reporting the errors. This API is designed for lightweight checks, such as confirming to a coding standard such as MISRA and compliance with a certain naming style.
 
-```sh
-$ python3 -m venv env
-$ source env/bin/activate.<shell> # choose the script based on your shell, e.g. POSIX shell, Bash, or Fish
-$ python3 setup.py install
-```
+The `cppcheckdata-shims` library does away with that. It offers the user several facilities for creating addons that do *actual* analysis work, such as:
 
-After having had installed the library, you can run one of the examples in the `examples` directory against one of the faulty codes in `erroneous-code` directory.
-
-As of right now, the features provided by the `cppcheckdata-shims` library are:
-
-- Contorl flow analysis
+- Control flow analysis
 - Data flow analysis
-- Abstract interpretation
-- Symbolic extection
 - Taint analysis
 - Type checking
+- Symbolic execution
+- Abstract interpretation
 
-This library comes with several *canonical examples*, all located under the `examples/` directory. These addons detect errors that Cppcheck itself does not detect! If you do not believe me, be my guest, test it out.
+And so on. The usage of this library has been documented in `docs/SHIMS_VADE_MECUM.md` --- *vade mecum* being a very pretentious way to say "manual". But that is not the only facet of this project. Basically, in this project, we have three substrates:
 
-This library comes with a substrate called "CASL" or *Cppcheck Addon Specification Language*. CASL is a S-Expression-based language for quick and easy authorship of Cppcheck addons. You *specify* your addon in CASL, call the `casl` utility on it, and it will generate the addon as a Python script --- an addon that utilizes the shims library.
+- The shims substrate
+- The CASL substrate
+- The liblint substrate
 
-This library is currently at version 0.1.0. The documentation leaves *a lot* to be desired. I am working on documentation, please be patient. I will also make a manpage for `casl`.
+The CASL substrate is still heavily WIP. CASL stands for "Cppcheck Addon Specification Language" and it is a S-Expression-based domain-specific language (DSL) used to 'describe' an addon in a declarative manner, and it will generate a Python script that carries out the specified analyses using the shims library.
 
-I recommend generating addons with an LLM, e.g. Opus 4.6. It is my intention to provide the user with means to provide LLMs with a context to generate plugins with.
+But `liblint` is a collection of linters and analyzers that utilize the shims library. To use `liblint`:
 
-This library is the intellectual property of Poyan Afzar. It is released under the MIT license. A good porition of the library is AI-generated, so this addon belongs to everyone who wishes to use it.
-
-The *vade mecum* for the library is available at `docs/SHIMS_VADE_MECUM.md`. But if you wish to build the library's *canonical* documentation, you can run `make html` or `make pdf` or `make latex`, or several other formats listed under `generate-docs.sh`. Make sure to run `pip3 install -r docs/requirements.txt` before attempting to build these documentation.
-
-An easy way to lint a file is to follow the following sequence of commands:
+1. Create a new Python virtual environment:
 ```sh
-$ cppcheck --dump foo.c
-$ PYTHONPATH="$PYTHONPATH:deps" liblint/integer-lint/IntegerLint.py foo.c.dump
+$ python3 -m venv env
 ```
 
-You need to `cd(1)` into the root directory, the directory this very file is located at. 
+2. Activate the virtual environment:
+```sh
+$ source env/bin/activate.sh
+```
+
+The extension of `activate` script version you should use, is variant based on your shell. For example, I run the Fish shell, so I must source `env/bin/activate.fish`. If you use a POSIX-based shell like Bash, `activate.sh` is your poistion -- and so on.
+
+3. Install the shims library:
+
+```sh
+$ python3 setup.y install
+```
+
+Now you can run `liblint` analyzers. Imagine we wish to run `Buflint` on a file called `foo.c`:
+
+```sh
+$ cppcheck --dump foo.c
+$ PYTHONPATH="$PYTHONPATH:deps" liblinb/buflint/Buflint.py foo.c.dump
+```
+
+You must `cd(1)` to the root directory of the project, the directory this very file is at. You need to add `deps/` directory to `$PYTHONPATH`, this is non-negotiable.
+
+If you have any problems running liblint, or the shims library, contact me at `behrang.nevi.93@gmail.com`.
