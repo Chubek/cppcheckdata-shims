@@ -30,3 +30,8 @@ This library is currently at version 0.1.0. The documentation leaves *a lot* to 
 I recommend generating addons with an LLM, e.g. Opus 4.6. It is my intention to provide the user with means to provide LLMs with a context to generate plugins with.
 
 This library is the intellectual property of Poyan Afzar. It is released under the MIT license. A good porition of the library is AI-generated, so this addon belongs to everyone who wishes to use it.
+
+The *vade mecum* for the library is available at `docs/SHIMS_VADE_MECUM.md`. But if you wish to build the library's *canonical* documentation, you can run `make html` or `make pdf` or `make latex`, or several other formats listed under `generate-docs.sh`. Make sure to run `pip3 install -r docs/requirements.txt` before attempting to build these documentation.
+
+
+
