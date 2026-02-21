@@ -286,3 +286,11 @@ Testing/
 
 # Cppcheck Dump Files
 *.c.dump
+
+# Documentation Output
+*.html
+*.pdf
+*.tex
+*.epub
+*.roff
+
