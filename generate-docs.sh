@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+t #!/usr/bin/env bash
 # =============================================================================
 #  generate-docs.sh — Master documentation build script
 #
