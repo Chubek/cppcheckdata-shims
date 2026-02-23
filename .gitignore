@@ -286,6 +286,8 @@ Testing/
 
 # Cppcheck Dump Files
 *.c.dump
+*.cpp.dump
+*.cc.dump
 
 # Documentation Output
 *.html
