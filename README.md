@@ -30,16 +30,16 @@ $ make
 
 There's a *manual* in `docs/vade-mecum`. The manual is written by myself and teaches the user how to utilize the shims library. The 'documentation' is just extracted docstrings.
 
-You can use `markdown(1)` and `pandoc(1)` to compile the generated Markdown files into PDF:
-
-```sh
-$ markdown docs/api/*.md > shimslib-docs.html
-$ pandoc shimslib-docs.html -o shimbslib-docs.pdf --pdf-engine=xelatex
-```
-
 An HTML version of these documentation is available [here](https://chubak.nekoweb.org/cppcheck-shimslib-docs.html).
 
-## LibLINT
+You can use the `docs/build_docs.py` to generate documentation in other formats, e.g.:
+
+```sh
+$ python3 docs/build_docs.py --format rst
+$ python3 docs/build_docs.py --format json
+```
+
+## LibLINT 
 
 LibLINT is a *massive* collection of addons for Cppcheck, all using the shims library. This library is growing and growing.
 
