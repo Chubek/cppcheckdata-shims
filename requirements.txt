@@ -14,3 +14,5 @@ sexpdata>=1.0.0
 
 # Term Color is a library for printing colorful text to the terminal
 termcolor==3.0.0
+
+z3-solver>=4.16.0.0
