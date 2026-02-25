@@ -1,53 +1,48 @@
-# Cppcheck Addon API Shims & the Lint Library Based Upon it
+# The Home of `cppcheckdata-shims`, CASL and LibLINT
 
-This is home to `cppcheckdata-shims` library, and the `liblint` substrate.
+This is the official repository for the `cppcheckdata-shims` library. A "shim", by definition, is an API that adds new features to another, often extremely bare-bones library. In `cppcheckdata.py`, the Cppcheck API module for building plugins, we exactly have such thing.
 
-The Cppcheck addon API, shipped alongside the analyzer in `addons/cppcheckdata.py`, leave *a lot* to be desired in terms of carrying the addon from its provenance to reporting the errors. This API is designed for lightweight checks, such as confirming to a coding standard such as MISRA and compliance with a certain naming style.
+`cppcheckdata.py` is solely responsible for parsing the XML 'dumpfile' that Cppcheck outputs for each *Translation Unit*, so its plugins to run wild. It parses the XML file into several `Configuration` objects, a 'configuration' being a single "semantically operational" form of the program --- and in fact, the term 'configuration' here is on lend from operational semantics.
 
-The `cppcheckdata-shims` library does away with that. It offers the user several facilities for creating addons that do *actual* analysis work, such as:
+Each `Configuration` holds with it:
+- The processed token stream, `Token` (as opposed to the 'raw' token stream, also available);
+- The functions of the Translation Unit, `Function`;
+- The variables of the Translation Unit, `Variable`;
+- The scopes of the Translation Unit, `Scope`;
+- The value flow and values, `ValueFlow`;
 
-- Control flow analysis
-- Data flow analysis
-- Taint analysis
-- Type checking
-- Symbolic execution
-- Abstract interpretation
+This representation is extremely *concrete*. Although the `Token` object represnts, for expressions, an abstract syntax tree, it is neither intraprocedural, nor interporcedural, it is merely a representation of a single expression.
 
-And so on. The usage of this library has been documented in `docs/SHIMS_VADE_MECUM.md` --- *vade mecum* being a very pretentious way to say "manual". But that is not the only facet of this project. Basically, in this project, we have three substrates:
+## The Solution: `cppcheckdata-shims`
 
-- The shims substrate
-- The CASL substrate
-- The liblint substrate
+This library, housed in the `cppcheckdata_shims` library, is the main life force of this project. This plugin is a 'shim API' for `cppcheckdata.py`. It has over 20 modules (as of now) that add build on top of `cppcheckdata.py`. These modules provide intermediate representation, analysis tools, and tools for abstraction interpretation, symbolic execution, control flow analysis, data flow analysis, and so on. We also provide tools for reporting errors, scoring the code, etc.
 
-The CASL substrate is still heavily WIP. CASL stands for "Cppcheck Addon Specification Language" and it is a S-Expression-based domain-specific language (DSL) used to 'describe' an addon in a declarative manner, and it will generate a Python script that carries out the specified analyses using the shims library.
+Take a gander at `MODULES.md` to understand what each module does. `cppcheckdata-shims` is a fully-fledged static analysis library, with Cppcheck as its mere provenance.
 
-But `liblint` is a collection of linters and analyzers that utilize the shims library. To use `liblint`:
+### Building the Documentation
 
-1. Create a new Python virtual environment:
-```sh
-$ python3 -m venv env
-```
-
-2. Activate the virtual environment:
-```sh
-$ source env/bin/activate.sh
-```
-
-The extension of `activate` script version you should use, is variant based on your shell. For example, I run the Fish shell, so I must source `env/bin/activate.fish`. If you use a POSIX-based shell like Bash, `activate.sh` is your poistion -- and so on.
-
-3. Install the shims library:
+The documentation is easily buildable using the following sequence of commands:
 
 ```sh
-$ python3 setup.y install
+$ cd docs
+$ make
 ```
 
-Now you can run `liblint` analyzers. Imagine we wish to run `Buflint` on a file called `foo.c`:
+There's a *manual* in `docs/vade-mecum`. The manual is written by myself and teaches the user how to utilize the shims library. The 'documentation' is just extracted docstrings.
+
+You can use `markdown(1)` and `pandoc(1)` to compile the generated Markdown files into PDF:
 
 ```sh
-$ cppcheck --dump foo.c
-$ PYTHONPATH="$PYTHONPATH:deps" liblinb/buflint/Buflint.py foo.c.dump
+$ markdown docs/api/*.md > shimslib-docs.html
+$ pandoc shimslib-docs.html -o shimbslib-docs.pdf --pdf-engine=xelatex
 ```
 
-You must `cd(1)` to the root directory of the project, the directory this very file is at. You need to add `deps/` directory to `$PYTHONPATH`, this is non-negotiable.
+An HTML version of these documentation is available [here](https://chubak.nekoweb.org/cppcheck-shimslib-docs.html).
 
-If you have any problems running liblint, or the shims library, contact me at `behrang.nevi.93@gmail.com`.
+## LibLINT
+
+LibLINT is a *massive* collection of addons for Cppcheck, all using the shims library. This library is growing and growing.
+
+## CASL
+
+CASL stands for "Cppcheck Addon Specification Language". It is a S-Expression-based *declarative constraint-based domain-specific language*, used for specification of Cppcheck addons. A CASL file compiles directly to a Python program that uses the shims library.
