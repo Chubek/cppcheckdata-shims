@@ -158,6 +158,22 @@ _CORE_MODULES = {
         "SafetyChecker",
         "TraceReconstructor",
     ],
+    "path_analysis": (
+        ".path_analysis",
+        [
+            "Path",
+            "Edge",
+            "PathEnumerator",
+            "PathPredicate",
+            "PathFilter",
+            "LTLFormula",
+            "CTLFormula",
+            "LTLEvaluator",
+            "CTLEvaluator",
+            "GraphLike",
+            "CFGAdapter",
+        ],
+    )
 }
 
 _ADDON_MODULES = {
@@ -171,6 +187,7 @@ _ADDON_MODULES = {
 # ---------------------------------------------------------------------------
 # Import machinery
 # ---------------------------------------------------------------------------
+
 
 def _import_names(
     module_rel_name: str,
@@ -256,6 +273,7 @@ __all__ += ["IV", "CG", "SC", "BE"]
 # ---------------------------------------------------------------------------
 # Package-level utilities
 # ---------------------------------------------------------------------------
+
 
 def list_submodules() -> List[str]:
     """Return names of all submodules in the package."""
@@ -356,4 +374,17 @@ if TYPE_CHECKING:
         SignDomain as SignDomain,
         ParityDomain as ParityDomain,
         CongruenceDomain as CongruenceDomain,
+    )
+    from .path_analysis import (
+        Path,
+        Edge,
+        PathEnumerator,
+        PathPredicate,
+        PathFilter,
+        LTLFormula,
+        CTLFormula,
+        LTLEvaluator,
+        CTLEvaluator,
+        GraphLike,
+        CFGAdapter,
     )
