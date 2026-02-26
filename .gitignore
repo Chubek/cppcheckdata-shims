@@ -298,3 +298,246 @@ Testing/
 *.epub
 *.roff
 
+# LaTeX Output
+
+# LaTeX files that are generated during compilation
+*.aux
+*.toc
+*.lof
+*.lot
+*.out
+*.bbl
+*.blg
+*.log
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.nav
+*.snm
+*.vrb
+*.thm
+*.toc
+*.lof
+*.lot
+*.idx
+*.ind
+*.ilg
+*.maf
+*.mtc*
+*.maf
+*.mtc
+*.run.xml
+*.bcf
+*.xdv
+
+# Output files
+*.pdf
+*.dvi
+*.ps
+*.eps
+
+# Backup files
+*~
+.*~
+*.bak
+*.backup
+
+# Temporary files
+*.tmp
+*.temp
+
+# Editor files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# LaTeX-specific editor files
+*.latexmain
+
+# TeXstudio files
+*.txslog
+*.txss
+
+# LyX files
+*.lyx~
+
+# Overleaf files
+*.overleaf-settings
+
+# MiKTeX files
+miktex/.tmprun
+
+# TeXShop files (macOS)
+*.tps
+
+# WinEdt files
+*.bak
+*.sav
+
+# Emacs files
+*#
+.#*
+
+# Vim files
+*.sw[op]
+
+# VS Code files
+*.code-workspace
+
+# Log files
+*.log
+
+# Auxiliary build files
+*.loa  # List of algorithms
+*.lol  # List of listings
+*.lom  # List of movies
+*.lor  # List of remarks
+*.los  # List of slides
+
+# Glossary files
+*.glg
+*.glo
+*.gls
+*.acn
+*.acr
+*.alg
+
+# Nomenclature files
+*.nlg
+*.nlo
+*.nls
+
+# Makeindex files
+*.ilg
+*.ind
+*.idx
+
+# Bibliography files that might be generated
+*.bbl
+*.blg
+
+# Beamer files
+*.nav
+*.snm
+*.vrb
+
+# TikZ externalization
+tikzExternalData.*
+
+# minted package files
+_minted*/
+minted-*
+
+# acronyms package
+*.acn
+*.acr
+*.alg
+
+# endnotes package
+*.enx
+
+# index package
+*.idx
+*.ilg
+*.ind
+
+# glossaries package
+*.glg
+*.glo
+*.gls
+*.glsdefs
+*.acn
+*.acr
+*.alg
+
+# nomencl package
+*.nlg
+*.nlo
+*.nls
+
+# pythontex package
+pythontex-files-*/
+*.pytxcode
+pythontex_*.py
+pythontex_*.pyc
+
+# sagetex package
+*.sagetex.sage
+*.sagetex.sage.py
+*.sagetex.scmd
+*.sout
+*.sage
+
+# knitr files
+*.knit.md
+*.utf8.md
+figure/
+
+# RStudio files
+*.Rproj.user/
+
+# ConTeXt files
+*.ctxout
+*.ctxrun
+
+# LuaLaTeX files
+*.lua
+
+# Asymptote files
+*.asy
+*.pre
+*.prc
+*.exp
+*.xasy
+*.gs
+*.m
+*.3d
+*.contour
+*.html
+*.svg
+
+# gnuplot files
+*.gnuplot
+*.table
+
+# MetaPost files
+*.mpx
+*.mps
+
+# pdfTeX files
+*.pdfsync
+
+# XeLaTeX files
+*.xdv
+
+# biblatex files
+*.bcf
+*.run.xml
+
+# latexmk files
+.latexmkrc
+.latexmkrc.edit
+
+# Custom output directories
+out/
+build/
+_output/
+_output_files/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE specific files
+.vscode/
+.idea/
+
+# LaTeX compiler cache
+*.cache
