@@ -26,8 +26,14 @@ ast_helpers
     Utility functions for navigating Cppcheck token/scope/variable structures.
 cost_algebra
     Symbolic cost expression algebra for parametric bound representation.
+transition_system
+    Explicit-state exploration, bounded model checking, and counterexample
+    trace reconstruction over the abstract state space.
+
+Auxiliary modules
+-----------------
 domains
-    Auxiliary abstract domains (sign, parity, congruence).
+    Additional abstract domains (sign, parity, congruence).
 
 Quick start
 -----------
@@ -37,12 +43,16 @@ Quick start
 >>> print(iv2)
 [1, 101]
 
+>>> from cppcheckdata_shims import SafetyChecker, BoundedExplorer
+>>> checker = SafetyChecker(my_transfer)
+>>> result = checker.check(initial_state)
+
 Package layout
 --------------
 ::
 
     cppcheckdata_shims/
-    ├── __init__.py            ← this file
+    ├── __init__.py              ← this file
     ├── interval.py
     ├── abstract_state.py
     ├── abstract_executor.py
@@ -52,6 +62,7 @@ Package layout
     ├── fixpoint.py
     ├── ast_helpers.py
     ├── cost_algebra.py
+    ├── transition_system.py     ← NEW: explicit-state layer
     └── domains.py
 """
 
@@ -67,22 +78,19 @@ from typing import TYPE_CHECKING, Any, List
 # Package metadata
 # ---------------------------------------------------------------------------
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __author__ = "Cppcheck Abstract Execution Contributors"
 __license__ = "GPL-3.0-or-later"
-__all__: List[str] = []          # populated incrementally below
+__all__: List[str] = []
 
 _log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Internal registry: (module_name, list_of_names_to_import)
-#
-# Modules are grouped into tiers:
-#   CORE  — always imported; failure is fatal
-#   ADDON — imported eagerly but failure only warns (package still usable)
+# Module registries
 # ---------------------------------------------------------------------------
 
 _CORE_MODULES = {
+    # --- Abstract Interpretation Substrate ---
     "interval": [
         "Interval",
         "IntervalDomain",
@@ -122,6 +130,7 @@ _CORE_MODULES = {
         "FixpointResult",
         "chaotic_iteration",
     ],
+    # --- Helpers & Algebras ---
     "ast_helpers": [
         "token_to_op",
         "scope_functions",
@@ -137,6 +146,18 @@ _CORE_MODULES = {
         "CostMul",
         "simplify_cost",
     ],
+    # --- Explicit-State Exploration Layer ---
+    "transition_system": [
+        "ExplorationStatus",
+        "Transition",
+        "TraceStep",
+        "Counterexample",
+        "ExplorationResult",
+        "ExplicitStateGraph",
+        "BoundedExplorer",
+        "SafetyChecker",
+        "TraceReconstructor",
+    ],
 }
 
 _ADDON_MODULES = {
@@ -148,7 +169,7 @@ _ADDON_MODULES = {
 }
 
 # ---------------------------------------------------------------------------
-# Lazy-import helper
+# Import machinery
 # ---------------------------------------------------------------------------
 
 def _import_names(
@@ -167,7 +188,7 @@ def _import_names(
         Public symbols to re-export.
     fatal:
         If ``True``, an ``ImportError`` propagates.  If ``False``, a warning
-        is issued and the names are skipped (addon tier).
+        is issued and the names are skipped.
     """
     fq_name = f"{__name__}.{module_rel_name}"
     try:
@@ -180,20 +201,21 @@ def _import_names(
             ) from exc
         warnings.warn(
             f"cppcheckdata_shims: optional submodule '{module_rel_name}' "
-            f"could not be imported ({exc}); related symbols will be unavailable.",
+            f"could not be imported ({exc}); "
+            f"related symbols will be unavailable.",
             ImportWarning,
             stacklevel=2,
         )
         _log.debug("Skipped optional module %s: %s", module_rel_name, exc)
         return
 
-    # Bind each name into the package namespace
     current_module = sys.modules[__name__]
     for name in names:
         obj = getattr(mod, name, None)
         if obj is None:
             msg = (
-                f"cppcheckdata_shims.{module_rel_name} does not export '{name}'"
+                f"cppcheckdata_shims.{module_rel_name} "
+                f"does not export '{name}'"
             )
             if fatal:
                 raise AttributeError(msg)
@@ -202,16 +224,14 @@ def _import_names(
         setattr(current_module, name, obj)
         __all__.append(name)
 
-    # Also expose the submodule itself as a package attribute so that
-    #   cppcheckdata_shims.interval.Interval
-    # works in addition to
-    #   cppcheckdata_shims.Interval
+    # Expose submodule as attribute:  cppcheckdata_shims.interval.Interval
     setattr(current_module, module_rel_name, mod)
     if module_rel_name not in __all__:
         __all__.append(module_rel_name)
 
+
 # ---------------------------------------------------------------------------
-# Eagerly import everything at package load time
+# Perform imports
 # ---------------------------------------------------------------------------
 
 for _mod, _names in _CORE_MODULES.items():
@@ -220,43 +240,36 @@ for _mod, _names in _CORE_MODULES.items():
 for _mod, _names in _ADDON_MODULES.items():
     _import_names(_mod, _names, fatal=False)
 
-# Clean up loop variables from the module namespace
 del _mod, _names
 
 # ---------------------------------------------------------------------------
-# Convenience aliases & derived constants
+# Convenience aliases
 # ---------------------------------------------------------------------------
 
-# Alias the most commonly used entry points under short names
-# so addons can write:  from cppcheckdata_shims import IV, CG
-IV = IntervalDomain          # noqa: F821  (bound dynamically above)
-CG = CallGraph               # noqa: F821
+IV = IntervalDomain       # noqa: F821 — bound dynamically above
+CG = CallGraph            # noqa: F821
+SC = SafetyChecker        # noqa: F821
+BE = BoundedExplorer      # noqa: F821
 
-__all__ += ["IV", "CG"]
+__all__ += ["IV", "CG", "SC", "BE"]
 
 # ---------------------------------------------------------------------------
 # Package-level utilities
 # ---------------------------------------------------------------------------
 
 def list_submodules() -> List[str]:
-    """Return the names of all submodules in the package (core + addon)."""
-    return sorted(set(list(_CORE_MODULES.keys()) + list(_ADDON_MODULES.keys())))
+    """Return names of all submodules in the package."""
+    return sorted(
+        set(list(_CORE_MODULES.keys()) + list(_ADDON_MODULES.keys()))
+    )
 
 
 def substrate_info() -> dict:
-    """Return a dict of metadata about the abstract execution substrate.
-
-    Useful for logging/diagnostics inside addons.
-    """
-    loaded = []
-    missing = []
+    """Return diagnostic metadata about the substrate."""
+    loaded, missing = [], []
     for mod_name in list_submodules():
         fq = f"{__name__}.{mod_name}"
-        if fq in sys.modules:
-            loaded.append(mod_name)
-        else:
-            missing.append(mod_name)
-
+        (loaded if fq in sys.modules else missing).append(mod_name)
     return {
         "package": __name__,
         "version": __version__,
@@ -270,12 +283,10 @@ def substrate_info() -> dict:
 __all__ += ["list_submodules", "substrate_info", "__version__"]
 
 # ---------------------------------------------------------------------------
-# TYPE_CHECKING block — gives IDEs full visibility without runtime cost
+# TYPE_CHECKING block — full IDE / mypy support
 # ---------------------------------------------------------------------------
 
 if TYPE_CHECKING:
-    # Re-declare every symbol for static type checkers / autocompletion.
-    # These imports are never executed at runtime (guarded by TYPE_CHECKING).
     from .interval import (
         Interval as Interval,
         IntervalDomain as IntervalDomain,
@@ -329,6 +340,17 @@ if TYPE_CHECKING:
         CostAdd as CostAdd,
         CostMul as CostMul,
         simplify_cost as simplify_cost,
+    )
+    from .transition_system import (
+        ExplorationStatus as ExplorationStatus,
+        Transition as Transition,
+        TraceStep as TraceStep,
+        Counterexample as Counterexample,
+        ExplorationResult as ExplorationResult,
+        ExplicitStateGraph as ExplicitStateGraph,
+        BoundedExplorer as BoundedExplorer,
+        SafetyChecker as SafetyChecker,
+        TraceReconstructor as TraceReconstructor,
     )
     from .domains import (
         SignDomain as SignDomain,
