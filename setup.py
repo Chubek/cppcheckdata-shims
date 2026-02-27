@@ -86,11 +86,11 @@ setup(
     long_description_content_type="text/markdown",
     license="MIT",
     author="cppcheckdata-shims contributors",
-    url="https://github.com/user/cppcheckdata-shims",
+    url="https://github.com/Chubek/cppcheckdata-shims",
     project_urls={
-        "Repository": "https://github.com/user/cppcheckdata-shims",
-        "Issues": "https://github.com/user/cppcheckdata-shims/issues",
-        "Documentation": "https://github.com/user/cppcheckdata-shims/tree/main/docs",
+        "Repository": "https://github.com/Chubek/cppcheckdata-shims",
+        "Issues": "https://github.com/Chubek/cppcheckdata-shims/issues",
+        "Documentation": "https://github.com/Chubek/cppcheckdata-shims/tree/main/docs",
     },
     python_requires=">=3.10",
     packages=find_packages(
@@ -141,10 +141,6 @@ setup(
             "casl=casl.__main__:main",
         ],
     },
-
-    # ── REMOVED — was the cause of the Errno 2 error ──────────────────
-    #  scripts=["bin/casl"],    # ← DO NOT USE — needs a physical file
-    #                           #    and duplicates what entry_points does
 
     classifiers=[
         "Development Status :: 3 - Alpha",
